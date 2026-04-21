@@ -1,0 +1,34 @@
+services:
+  floci:
+    image: hectorvent/floci
+    container_name: floci
+    ports:
+      - "4566:4566"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+    environment:
+      - FLOCI_STORAGE_HOST_PERSISTENT_PATH=${PWD}/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_floci/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+
+  floci-duck:
+    build:
+      context: .
+      args:
+        - BUILD_PROFILE=debug
+    container_name: floci-duck
+    ports:
+      - "3000:3000"
+    environment:
+      - FLOCI_DUCK_LOG=info
+      - FLOCI_DUCK_S3_REGION=us-east-1
+      - FLOCI_DUCK_S3_ACCESS_KEY=flociadmin
+      - FLOCI_DUCK_S3_SECRET_KEY=flociadmin
+    depends_on:
+      floci:
+        condition: service_healthy

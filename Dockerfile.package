@@ -1,0 +1,15 @@
+# Use debian:bookworm-slim for stable glibc and DuckDB extension support
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    libcurl4 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+COPY bin/${TARGETARCH}/floci-duck /floci-duck
+RUN chmod +x /floci-duck
+
+EXPOSE 3000
+ENTRYPOINT ["/floci-duck"]

@@ -1,0 +1,28 @@
+{
+  "branches": [
+    "main",
+    {
+      "name": "release/[0-9]+.x",
+      "prerelease": false
+    }
+  ],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    "@semantic-release/changelog",
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "sed -i 's/^version = \".*\"/version = \"${nextRelease.version}\"/' Cargo.toml"
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["Cargo.toml", "CHANGELOG.md"],
+        "message": "chore(release): ${nextRelease.version} \n\n${nextRelease.notes}"
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}
