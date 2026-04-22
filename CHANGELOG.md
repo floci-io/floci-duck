@@ -1,3 +1,11 @@
+## [0.1.2](https://github.com/floci-io/floci-duck/compare/v0.1.1...0.1.2) (2026-04-22)
+
+
+### Bug Fixes
+
+* updating wrong branch in semver ([f100c0f](https://github.com/floci-io/floci-duck/commit/f100c0f103925c14a91a50ba1dd90063ce615031))
+* updating wrong branch in semver ([7b52cb4](https://github.com/floci-io/floci-duck/commit/7b52cb4f04dbbbad31ce42250d57fcbff9e39c66))
+
 ## [0.1.1](https://github.com/floci-io/floci-duck/compare/v0.1.0...v0.1.1) (2026-04-22)
 
 
