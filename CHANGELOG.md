@@ -1,3 +1,10 @@
+## [0.1.4](https://github.com/floci-io/floci-duck/compare/0.1.3...0.1.4) (2026-04-24)
+
+
+### Bug Fixes
+
+* docker targetarch in wrong location ([09e0d48](https://github.com/floci-io/floci-duck/commit/09e0d4868f446c82ac9563cfae9e5a210b5a6174))
+
 ## [0.1.3](https://github.com/floci-io/floci-duck/compare/0.1.2...0.1.3) (2026-04-24)
 
 
