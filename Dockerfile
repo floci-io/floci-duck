@@ -24,7 +24,7 @@ RUN strip target/release/floci-duck
 FROM gcr.io/distroless/cc-debian12
 
 # Copy the binary
-COPY --from=builder /usr/src/floci-duck/target/release/floci-duck /floci-duck
+COPY --from=builder --chmod=0755 /usr/src/floci-duck/target/release/floci-duck /floci-duck
 
 EXPOSE 3000
 ENTRYPOINT ["/floci-duck"]

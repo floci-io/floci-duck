@@ -1,7 +1,7 @@
 FROM gcr.io/distroless/cc-debian12
 ARG TARGETARCH
 
-COPY bin/${TARGETARCH}/floci-duck /floci-duck
+COPY --chmod=0755 bin/${TARGETARCH}/floci-duck /floci-duck
 
 EXPOSE 3000
 ENTRYPOINT ["/floci-duck"]

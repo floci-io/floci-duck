@@ -3,6 +3,7 @@ mod executor;
 mod handlers;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -22,7 +23,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
-        .route("/execute", post(handlers::handle_execute));
+        .route("/execute", post(handlers::handle_execute))
+        .layer(DefaultBodyLimit::max(1024 * 1024));
 
     let port = env::var("FLOCI_DUCK_PORT").unwrap_or_else(|_| "3000".to_string());
     let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().expect("Invalid address");
