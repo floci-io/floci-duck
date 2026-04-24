@@ -1,5 +1,5 @@
-ARG TARGETARCH
 FROM gcr.io/distroless/cc-debian12
+ARG TARGETARCH
 
 COPY bin/${TARGETARCH}/floci-duck /floci-duck
 
