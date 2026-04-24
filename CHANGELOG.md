@@ -1,3 +1,10 @@
+## [0.1.5](https://github.com/floci-io/floci-duck/compare/0.1.4...0.1.5) (2026-04-24)
+
+
+### Bug Fixes
+
+* docker executable issue and adding correlation_id ([a888271](https://github.com/floci-io/floci-duck/commit/a888271f02be0c092b14298665e084288a1251bb))
+
 ## [0.1.4](https://github.com/floci-io/floci-duck/compare/0.1.3...0.1.4) (2026-04-24)
 
 
