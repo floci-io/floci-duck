@@ -1,3 +1,10 @@
+## [0.1.3](https://github.com/floci-io/floci-duck/compare/0.1.2...0.1.3) (2026-04-24)
+
+
+### Bug Fixes
+
+* docker image issue and reduce size ([e4bd72b](https://github.com/floci-io/floci-duck/commit/e4bd72b10f38ff7ebcb0f40ebe8599d9ade245d9))
+
 ## [0.1.2](https://github.com/floci-io/floci-duck/compare/v0.1.1...0.1.2) (2026-04-22)
 
 
