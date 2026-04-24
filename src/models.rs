@@ -11,6 +11,7 @@ pub struct ExecuteRequest {
     pub s3_use_ssl: Option<bool>,
     pub s3_url_style: Option<String>,
     pub output_s3_path: Option<String>,
+    pub setup_sql: Option<String>,
     #[allow(dead_code)]
     pub variables: Option<HashMap<String, String>>,
 }

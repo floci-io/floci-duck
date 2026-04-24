@@ -61,11 +61,17 @@ pub fn execute_query(req: &ExecuteRequest) -> anyhow::Result<()> {
         url_style
     ))?;
 
-    // Athena mode: if output_s3_path is provided, wrap query in COPY
+    // Run setup DDL (e.g. CREATE OR REPLACE VIEW for Glue tables) before the main query
+    if let Some(setup) = &req.setup_sql {
+        if !setup.trim().is_empty() {
+            info!("Executing setup SQL");
+            conn.execute_batch(setup)?;
+        }
+    }
+
+    // Athena mode: wrap only the user SELECT in COPY; setup DDL ran above
     let final_sql = if let Some(output_path) = &req.output_s3_path {
         info!("Athena mode detected. Output path: {}", output_path);
-        // We use a simple wrap with COPY. 
-        // Important: this assumes the input sql is a valid SELECT statement.
         format!("COPY ({}) TO '{}' (FORMAT CSV, HEADER);", req.sql, output_path)
     } else {
         info!("Firehose mode detected. Running raw SQL.");

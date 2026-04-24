@@ -21,13 +21,7 @@ RUN cargo build --release
 RUN strip target/release/floci-duck
 
 # Stage 2: Final
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y \
-    libssl3 \
-    libcurl4 \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian12
 
 # Copy the binary
 COPY --from=builder /usr/src/floci-duck/target/release/floci-duck /floci-duck

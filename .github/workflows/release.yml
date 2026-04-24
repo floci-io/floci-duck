@@ -17,6 +17,9 @@ jobs:
   build-binaries:
     name: Build binary (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    # Build inside rust:slim-bookworm to target glibc 2.36, matching the
+    # distroless/cc-debian12 runtime used in Dockerfile.package.
+    container: rust:slim-bookworm
     strategy:
       matrix:
         include:
@@ -32,13 +35,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake libssl-dev libcurl4-openssl-dev pkg-config
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+          apt-get update
+          apt-get install -y build-essential cmake libssl-dev libcurl4-openssl-dev pkg-config
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
