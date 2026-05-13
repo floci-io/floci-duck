@@ -22,3 +22,26 @@ pub struct ExecuteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+/// Request for /query — runs SQL and returns rows as JSON.
+/// S3 fields mirror ExecuteRequest so callers can share the same config.
+#[derive(Debug, Deserialize)]
+pub struct QueryRequest {
+    pub sql: String,
+    pub s3_endpoint: String,
+    pub s3_region: Option<String>,
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
+    pub s3_use_ssl: Option<bool>,
+    pub s3_url_style: Option<String>,
+    pub setup_sql: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct QueryResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}

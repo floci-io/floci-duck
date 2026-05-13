@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+# duck-test — integration test CLI for floci-duck
+set -euo pipefail
+
+# ── Defaults (all overridable via flags or env) ───────────────────────────────
+BASE_URL="${FLOCI_DUCK_URL:-http://localhost:3000}"
+S3_ENDPOINT="${FLOCI_DUCK_S3_ENDPOINT:-http://floci:4566}"      # server-facing
+S3_ENDPOINT_CLI="${FLOCI_DUCK_S3_ENDPOINT_CLI:-http://localhost:4566}" # host aws CLI
+S3_REGION="${FLOCI_DUCK_S3_REGION:-us-east-1}"
+S3_ACCESS_KEY="${FLOCI_DUCK_S3_ACCESS_KEY:-flociadmin}"
+S3_SECRET_KEY="${FLOCI_DUCK_S3_SECRET_KEY:-flociadmin}"
+BUCKET="${FLOCI_DUCK_BUCKET:-test-bucket}"
+VERBOSE=false
+
+# ── Counters ──────────────────────────────────────────────────────────────────
+PASS=0
+FAIL=0
+SKIP=0
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; YELLOW=$'\033[0;33m'
+    CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+    GREEN=''; RED=''; YELLOW=''; CYAN=''; BOLD=''; RESET=''
+fi
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+section() { echo -e "\n${CYAN}${BOLD}══ $* ══${RESET}" >&2; }
+
+pass() { echo -e "  ${GREEN}[PASS]${RESET} $*" >&2; PASS=$((PASS+1)); }
+fail() { echo -e "  ${RED}[FAIL]${RESET} $*" >&2; FAIL=$((FAIL+1)); }
+skip() { echo -e "  ${YELLOW}[SKIP]${RESET} $*" >&2; SKIP=$((SKIP+1)); }
+info() { echo -e "        $*" >&2; }
+vinfo() { if $VERBOSE; then info "$@"; fi; }  # verbose-only info
+
+# Split curl response (body + status on last line)
+body_of()   { echo "$1" | sed '$d'; }
+status_of() { echo "$1" | tail -n1; }
+
+# POST to /query, return body\nstatus
+post_query() {
+    curl -s -w '\n%{http_code}' -X POST "$BASE_URL/query" \
+        -H "Content-Type: application/json" \
+        -d "$1"
+}
+
+# POST to /execute, return body\nstatus
+post_execute() {
+    curl -s -w '\n%{http_code}' -X POST "$BASE_URL/execute" \
+        -H "Content-Type: application/json" \
+        -d "$1"
+}
+
+# Shared S3 fields for JSON payloads
+s3_fields() {
+    cat <<EOF
+  "s3_endpoint": "$S3_ENDPOINT",
+  "s3_region": "$S3_REGION",
+  "s3_access_key": "$S3_ACCESS_KEY",
+  "s3_secret_key": "$S3_SECRET_KEY"
+EOF
+}
+
+# Check a /query or /execute response; echoes body to stdout for callers
+check_ok() {
+    local label="$1" raw="$2"
+    local body status result
+    body=$(body_of "$raw"); status=$(status_of "$raw")
+    result=$(echo "$body" | jq -r '.status // empty' 2>/dev/null)
+    if [[ "$status" -eq 200 && "$result" == "success" ]]; then
+        pass "$label"
+        vinfo "$(echo "$body" | jq .)"
+    else
+        fail "$label  (HTTP $status, status=$result)"
+        info "$(echo "$body" | jq -r '.message // .' 2>/dev/null)"
+    fi
+    echo "$body"
+}
+
+# aws CLI wrapper using host-facing endpoint
+aws_s3() {
+    AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
+    aws --endpoint-url "$S3_ENDPOINT_CLI" s3 "$@"
+}
+
+ensure_bucket() {
+    aws_s3 mb "s3://$BUCKET" 2>/dev/null && info "bucket '$BUCKET' created" \
+        || info "bucket '$BUCKET' already exists"
+}
+
+# ── Suites ────────────────────────────────────────────────────────────────────
+
+suite_init() {
+    section "init  (S3 resources)"
+
+    if ! command -v aws &>/dev/null; then
+        fail "aws CLI not found — cannot create bucket"
+        return
+    fi
+
+    ensure_bucket
+
+    info "listing buckets:"
+    AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
+    aws --endpoint-url "$S3_ENDPOINT_CLI" s3 ls 2>/dev/null \
+        | while IFS= read -r line; do info "  $line"; done
+
+    pass "S3 resources ready"
+}
+
+suite_health() {
+    section "health"
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/health")
+    if [[ "$code" == "200" ]]; then
+        pass "/health → 200 OK"
+    else
+        fail "/health → HTTP $code  (is the server running at $BASE_URL?)"
+    fi
+}
+
+suite_query() {
+    section "query  (/query returns rows)"
+
+    local raw body
+
+    # basic SELECT
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT 42 AS answer, 'hello' AS greeting",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "basic SELECT" "$raw")
+    vinfo "rows: $(echo "$body" | jq '.rows')"
+
+    # multiple rows
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT val FROM range(5) t(val)",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "multiple rows (range 5)" "$raw")
+    local n; n=$(echo "$body" | jq '.rows | length')
+    info "row count: $n (expected 5)"
+    [[ "$n" -eq 5 ]] || fail "  row count mismatch"
+
+    # NULL handling
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT NULL AS nothing, 1 AS something",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "NULL value" "$raw")
+    vinfo "rows: $(echo "$body" | jq '.rows')"
+
+    # numeric types
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT 1::INT8 AS i8, 3.14::FLOAT AS f, 9.99::DECIMAL(5,2) AS d",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "numeric types (INT8, FLOAT, DECIMAL)" "$raw")
+    vinfo "rows: $(echo "$body" | jq '.rows')"
+
+    # setup_sql
+    raw=$(post_query "$(cat <<EOF
+{
+  "sql": "SELECT * FROM people WHERE age > 25",
+  "setup_sql": "CREATE VIEW people AS SELECT * FROM (VALUES ('Alice',30),('Bob',20),('Carol',35)) t(name,age);",
+  $(s3_fields)
+}
+EOF
+)")
+    body=$(check_ok "setup_sql creates view before query" "$raw")
+    vinfo "rows: $(echo "$body" | jq '.rows')"
+
+    # x-correlation-id
+    raw=$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/query" \
+        -H "Content-Type: application/json" \
+        -H "x-correlation-id: duck-test-corr-1" \
+        -d "$(cat <<EOF
+{"sql":"SELECT 'corr' AS label",$(s3_fields)}
+EOF
+)")
+    check_ok "x-correlation-id header accepted" "$raw" > /dev/null
+
+    # invalid SQL → 500
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT * FROM nonexistent_table_xyz",$(s3_fields)}
+EOF
+)")
+    local status; status=$(status_of "$raw")
+    local msg;    msg=$(body_of "$raw" | jq -r '.message // empty' 2>/dev/null)
+    if [[ "$status" -eq 500 ]]; then
+        pass "invalid SQL returns HTTP 500"
+        info "message: $msg"
+    else
+        fail "invalid SQL expected HTTP 500, got $status"
+    fi
+}
+
+suite_execute() {
+    section "execute  (/execute fire-and-forget)"
+
+    local raw
+
+    # direct SQL (firehose mode)
+    raw=$(post_execute "$(cat <<EOF
+{
+  "sql": "CREATE TABLE _test AS SELECT * FROM (VALUES (1,'Alice'),(2,'Bob')) t(id,name);",
+  $(s3_fields),
+  "variables": {}
+}
+EOF
+)")
+    check_ok "direct SQL (firehose mode)" "$raw" > /dev/null
+
+    # query with S3 output (athena mode)
+    local out_path="s3://${BUCKET}/results/duck_test_$(date +%s).csv"
+    raw=$(post_execute "$(cat <<EOF
+{
+  "sql": "SELECT * FROM range(10) t(val)",
+  "output_s3_path": "$out_path",
+  $(s3_fields),
+  "variables": {}
+}
+EOF
+)")
+    check_ok "athena mode → CSV to S3 ($out_path)" "$raw" > /dev/null
+
+    # variable substitution
+    raw=$(post_execute "$(cat <<EOF
+{
+  "sql": "SELECT '{{env}}' AS environment",
+  $(s3_fields),
+  "variables": {"env": "test"}
+}
+EOF
+)")
+    check_ok "variable substitution" "$raw" > /dev/null
+}
+
+suite_parquet() {
+    section "parquet  (S3 round-trip)"
+
+    if ! command -v aws &>/dev/null; then
+        skip "aws CLI not found — skipping parquet suite"
+        return
+    fi
+
+    ensure_bucket
+
+    local key="duck-test/sales_$(date +%s).parquet"
+    local s3_path="s3://${BUCKET}/${key}"
+
+    # write
+    local raw body
+    raw=$(post_execute "$(cat <<EOF
+{
+  "sql": "COPY (SELECT id,name,amount FROM (VALUES (1,'Alice',99.5),(2,'Bob',150.0),(3,'Carol',42.75),(4,'Dave',200.0)) t(id,name,amount)) TO '$s3_path' (FORMAT PARQUET);",
+  $(s3_fields),
+  "variables": {}
+}
+EOF
+)")
+    check_ok "write parquet to S3" "$raw" > /dev/null
+
+    # SELECT *
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT * FROM '$s3_path' ORDER BY id",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "SELECT * from parquet" "$raw")
+    local n; n=$(echo "$body" | jq '.rows | length')
+    info "row count: $n (expected 4)"
+    vinfo "$(echo "$body" | jq '.rows')"
+
+    # filter
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT name, amount FROM '$s3_path' WHERE amount > 100 ORDER BY amount",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "parquet filter WHERE amount > 100" "$raw")
+    vinfo "rows: $(echo "$body" | jq '.rows')"
+
+    # aggregate
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT COUNT(*) AS total, SUM(amount) AS revenue FROM '$s3_path'",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "parquet aggregate SUM/COUNT" "$raw")
+    local total revenue
+    total=$(echo "$body"  | jq -r '.rows[0].total')
+    revenue=$(echo "$body" | jq -r '.rows[0].revenue')
+    info "total=$total (expected 4), revenue=$revenue (expected 492.25)"
+    [[ "$total" == "4" ]] || fail "  total mismatch"
+
+    # schema
+    raw=$(post_query "$(cat <<EOF
+{"sql":"DESCRIBE SELECT * FROM '$s3_path'",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "parquet DESCRIBE schema" "$raw")
+    vinfo "schema: $(echo "$body" | jq '[.rows[] | {column:.column_name, type:.column_type}]')"
+}
+
+suite_http() {
+    section "http  (httpfs extension)"
+
+    local raw body
+
+    # Verify httpfs loads without depending on external URLs
+    raw=$(post_execute "$(cat <<EOF
+{
+  "sql": "LOAD httpfs; SELECT 1 AS httpfs_loaded;",
+  $(s3_fields),
+  "variables": {}
+}
+EOF
+)")
+    check_ok "httpfs extension loads" "$raw" > /dev/null
+
+    # Verify S3 settings are applied to the session
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT current_setting('s3_endpoint') AS endpoint",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "S3 settings applied to session" "$raw")
+    vinfo "s3_endpoint: $(echo "$body" | jq -r '.rows[0].endpoint')"
+}
+
+suite_validate() {
+    section "validate  (latest S3 result)"
+
+    if ! command -v aws &>/dev/null; then
+        skip "aws CLI not found — skipping validate suite"
+        return
+    fi
+
+    local latest
+    latest=$(aws_s3 ls "s3://$BUCKET/results/" 2>/dev/null | sort | tail -n1 | awk '{print $4}')
+
+    if [[ -z "$latest" ]]; then
+        skip "no result files in s3://$BUCKET/results/ — run 'execute' suite first"
+        return
+    fi
+
+    local tmp; tmp=$(mktemp /tmp/duck-test-XXXXXX.csv)
+    aws_s3 cp "s3://$BUCKET/results/$latest" "$tmp" > /dev/null
+    pass "downloaded s3://$BUCKET/results/$latest"
+    echo "" >&2
+    cat "$tmp" >&2
+    echo "" >&2
+    rm -f "$tmp"
+}
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+${BOLD}duck-test${RESET} — integration test CLI for floci-duck
+
+${BOLD}Usage:${RESET}
+  ./duck-test [OPTIONS] <SUITE> [SUITE...]
+
+${BOLD}Suites:${RESET}
+  init       Create S3 bucket and list resources (replaces init_resources.sh)
+  health     Check server is up
+  query      /query endpoint — returns rows as JSON
+  execute    /execute endpoint — fire-and-forget (firehose/athena modes)
+  parquet    Parquet round-trip via S3 (requires aws CLI)
+  http       httpfs extension loads + S3 settings verified
+  validate   Download and print the latest result file from S3
+  all        Run every suite above (init → health → query → execute → parquet → http → validate)
+
+${BOLD}Options:${RESET}
+  --url URL              floci-duck server URL        [default: $BASE_URL]
+  --s3-endpoint URL      S3 endpoint (server-facing)  [default: $S3_ENDPOINT]
+  --s3-endpoint-cli URL  S3 endpoint (aws CLI / host) [default: $S3_ENDPOINT_CLI]
+  --s3-region REGION     S3 region                    [default: $S3_REGION]
+  --s3-access-key KEY    S3 access key                [default: $S3_ACCESS_KEY]
+  --s3-secret-key KEY    S3 secret key                [default: $S3_SECRET_KEY]
+  --bucket BUCKET        S3 bucket name               [default: $BUCKET]
+  -v, --verbose          Print full response bodies
+  -h, --help             Show this help
+
+${BOLD}Examples:${RESET}
+  ./duck-test all
+  ./duck-test health query
+  ./duck-test parquet --bucket my-bucket -v
+  ./duck-test execute --url http://localhost:3000 --s3-endpoint http://localhost:4566
+EOF
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+SUITES=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --url)              BASE_URL="$2";         shift 2 ;;
+        --s3-endpoint)      S3_ENDPOINT="$2";      shift 2 ;;
+        --s3-endpoint-cli)  S3_ENDPOINT_CLI="$2";  shift 2 ;;
+        --s3-region)        S3_REGION="$2";        shift 2 ;;
+        --s3-access-key)    S3_ACCESS_KEY="$2";    shift 2 ;;
+        --s3-secret-key)    S3_SECRET_KEY="$2";    shift 2 ;;
+        --bucket)           BUCKET="$2";           shift 2 ;;
+        -v|--verbose)       VERBOSE=true;          shift   ;;
+        -h|--help)          usage; exit 0          ;;
+        init|health|query|execute|parquet|http|validate|all)
+                            SUITES+=("$1"); shift ;;
+        *) echo "Unknown argument: $1"; usage; exit 1 ;;
+    esac
+done
+
+if [[ ${#SUITES[@]} -eq 0 ]]; then
+    usage; exit 0
+fi
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+run_suite() {
+    case "$1" in
+        init)     suite_init     ;;
+        health)   suite_health   ;;
+        query)    suite_query    ;;
+        execute)  suite_execute  ;;
+        parquet)  suite_parquet  ;;
+        http)     suite_http     ;;
+        validate) suite_validate ;;
+        all)      suite_init; suite_health; suite_query; suite_execute; suite_parquet; suite_http; suite_validate ;;
+    esac
+}
+
+echo -e "${BOLD}duck-test${RESET}  →  $BASE_URL  |  S3: $S3_ENDPOINT" >&2
+
+for suite in "${SUITES[@]}"; do
+    run_suite "$suite"
+done
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo "" >&2
+echo -e "${BOLD}══════════════════════════════${RESET}" >&2
+printf "  ${GREEN}PASS: %-4s${RESET}  ${RED}FAIL: %-4s${RESET}  ${YELLOW}SKIP: %s${RESET}\n" \
+    "$PASS" "$FAIL" "$SKIP" >&2
+echo -e "${BOLD}══════════════════════════════${RESET}" >&2
+
+[[ "$FAIL" -eq 0 ]]

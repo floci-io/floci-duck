@@ -5,7 +5,7 @@
 # Starts the local Floci infrastructure
 dev-infra:
 	docker-compose up -d floci
-	./init_resources.sh
+	./duck-test init
 
 # Stops the local Floci infrastructure
 stop-infra:
