@@ -1,3 +1,10 @@
+# [0.2.0](https://github.com/floci-io/floci-duck/compare/0.1.5...0.2.0) (2026-05-13)
+
+
+### Features
+
+* adding query for S3Select ([c29c4ac](https://github.com/floci-io/floci-duck/commit/c29c4ac1e34452048cc0a382c909c1666ca7cb52))
+
 ## [0.1.5](https://github.com/floci-io/floci-duck/compare/0.1.4...0.1.5) (2026-04-24)
 
 
