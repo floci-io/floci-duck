@@ -1,18 +1,17 @@
 [package]
 name = "floci-duck"
 version = "0.3.0" 
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-axum = "0.7.5"
-tokio = { version = "1.37.0", features = ["full"] }
-duckdb = { version = "1.1.1", features = ["bundled", "parquet", "json", "extensions-full"] }
-serde = { version = "1.0.203", features = ["derive"] }
-serde_json = { version = "1.0.117", features = ["preserve_order"] }
-tower-http = { version = "0.5.2", features = ["trace"] }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-anyhow = "1.0.86"
+axum = "0.8.9"
+tokio = { version = "1.52.3", features = ["full"] }
+duckdb = { version = "1.10504.0", features = ["bundled", "parquet", "json", "extensions-full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+anyhow = "1.0.103"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 # Arrow IPC framing for /query responses (duckdb-rs builds arrow without the ipc feature).
 arrow-ipc = { version = "58", default-features = false }
