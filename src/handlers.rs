@@ -75,11 +75,12 @@ pub async fn handle_query(
         }).await;
 
         match result {
-            Ok(Ok(rows)) => {
-                info!("Query returned {} rows", rows.len());
+            Ok(Ok(output)) => {
+                info!("Query returned {} rows", output.rows.len());
                 (StatusCode::OK, Json(QueryResponse {
                     status: "success".to_string(),
-                    rows: Some(rows),
+                    columns: Some(output.columns),
+                    rows: Some(output.rows),
                     message: None,
                 }))
             }
@@ -87,6 +88,7 @@ pub async fn handle_query(
                 error!("Query execution failed: {:?}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(QueryResponse {
                     status: "error".to_string(),
+                    columns: None,
                     rows: None,
                     message: Some(e.to_string()),
                 }))
@@ -95,6 +97,7 @@ pub async fn handle_query(
                 error!("Query task panicked: {:?}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(QueryResponse {
                     status: "error".to_string(),
+                    columns: None,
                     rows: None,
                     message: Some("Internal error".to_string()),
                 }))

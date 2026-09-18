@@ -1,11 +1,14 @@
-use crate::models::{ExecuteRequest, QueryRequest};
+use crate::models::{Column, ExecuteRequest, QueryRequest};
 use duckdb::arrow::array::{
-    Array as ArrowArray, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray, UInt16Array, UInt32Array,
-    UInt64Array, UInt8Array,
+    Array as ArrowArray, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
+    FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray, StringArray,
+    StructArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use duckdb::arrow::datatypes::DataType;
 use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
+use duckdb::core::LogicalTypeId;
 use duckdb::Connection;
 use std::env;
 use tracing::info;
@@ -165,14 +168,18 @@ pub fn execute_query(req: ExecuteRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Query executor that returns rows as JSON maps — used by S3 Select.
+/// Result of `/query`: the column names and DuckDB types, plus the rows.
+pub struct QueryOutput {
+    pub columns: Vec<Column>,
+    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Query executor that returns rows as JSON maps, used by S3 Select and BigQuery.
 ///
 /// Uses `query_arrow()` so schema (column names) and data are available together
 /// without the borrow conflict that arises when calling `column_names()` on a
 /// `Rows`-borrowed statement.
-pub fn execute_query_returning(
-    req: QueryRequest,
-) -> anyhow::Result<Vec<serde_json::Map<String, serde_json::Value>>> {
+pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput> {
     let conn = open_conn()?;
 
     let (region, access_key, secret_key, use_ssl, url_style) = resolve_s3_params(
@@ -205,6 +212,8 @@ pub fn execute_query_returning(
     let mut stmt = conn.prepare(&req.sql)?;
     let batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
 
+    let columns = result_columns(&stmt);
+
     let mut result = Vec::new();
     for batch in &batches {
         let field_names: Vec<String> = batch
@@ -218,14 +227,232 @@ pub fn execute_query_returning(
             let mut map = serde_json::Map::new();
             for (col_idx, name) in field_names.iter().enumerate() {
                 let col = batch.column(col_idx);
-                map.insert(name.clone(), arrow_value_to_json(col.as_ref(), row_idx));
+                let value = if req.typed_values {
+                    arrow_value_to_typed_json(col.as_ref(), row_idx)
+                } else {
+                    arrow_value_to_json(col.as_ref(), row_idx)
+                };
+                map.insert(name.clone(), value);
             }
             result.push(map);
         }
     }
 
     info!("Query returned {} rows", result.len());
-    Ok(result)
+    Ok(QueryOutput {
+        columns,
+        rows: result,
+    })
+}
+
+fn result_columns(stmt: &duckdb::Statement<'_>) -> Vec<Column> {
+    let schema = stmt.schema();
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| Column {
+            name: field.name().clone(),
+            type_name: column_type_sql(field.data_type(), stmt.column_logical_type(idx).id()),
+        })
+        .collect()
+}
+
+/// Renders a result column's type as DuckDB SQL, the way `DESCRIBE` prints it
+/// (e.g. `DECIMAL(38,9)`, `TIMESTAMP WITH TIME ZONE`, `STRUCT("a" INTEGER[])`).
+///
+/// The structure comes from the Arrow schema; the column's DuckDB logical type id only
+/// disambiguates types Arrow folds into another (HUGEINT exports as DECIMAL(38,0), UUID
+/// and ENUM as strings).
+pub fn column_type_sql(arrow: &DataType, logical: LogicalTypeId) -> String {
+    match logical {
+        LogicalTypeId::Hugeint => "HUGEINT".into(),
+        LogicalTypeId::UHugeint => "UHUGEINT".into(),
+        LogicalTypeId::Uuid => "UUID".into(),
+        LogicalTypeId::Enum => "ENUM".into(),
+        LogicalTypeId::TimeTZ => "TIME WITH TIME ZONE".into(),
+        LogicalTypeId::Bit => "BIT".into(),
+        _ => arrow_type_sql(arrow),
+    }
+}
+
+fn arrow_type_sql(t: &DataType) -> String {
+    match t {
+        DataType::Null => "\"NULL\"".into(),
+        DataType::Boolean => "BOOLEAN".into(),
+        DataType::Int8 => "TINYINT".into(),
+        DataType::Int16 => "SMALLINT".into(),
+        DataType::Int32 => "INTEGER".into(),
+        DataType::Int64 => "BIGINT".into(),
+        DataType::UInt8 => "UTINYINT".into(),
+        DataType::UInt16 => "USMALLINT".into(),
+        DataType::UInt32 => "UINTEGER".into(),
+        DataType::UInt64 => "UBIGINT".into(),
+        DataType::Float16 | DataType::Float32 => "FLOAT".into(),
+        DataType::Float64 => "DOUBLE".into(),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("DECIMAL({},{})", p, s),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR".into(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_) => {
+            "BLOB".into()
+        }
+        DataType::Date32 | DataType::Date64 => "DATE".into(),
+        DataType::Time32(_) | DataType::Time64(_) => "TIME".into(),
+        DataType::Timestamp(_, Some(_)) => "TIMESTAMP WITH TIME ZONE".into(),
+        DataType::Timestamp(unit, None) => match unit {
+            duckdb::arrow::datatypes::TimeUnit::Second => "TIMESTAMP_S".into(),
+            duckdb::arrow::datatypes::TimeUnit::Millisecond => "TIMESTAMP_MS".into(),
+            duckdb::arrow::datatypes::TimeUnit::Nanosecond => "TIMESTAMP_NS".into(),
+            duckdb::arrow::datatypes::TimeUnit::Microsecond => "TIMESTAMP".into(),
+        },
+        DataType::Interval(_) | DataType::Duration(_) => "INTERVAL".into(),
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            format!("{}[]", arrow_type_sql(f.data_type()))
+        }
+        DataType::Struct(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| format!("\"{}\" {}", f.name().replace('"', "\"\""), arrow_type_sql(f.data_type())))
+                .collect();
+            format!("STRUCT({})", parts.join(", "))
+        }
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(kv) if kv.len() == 2 => format!(
+                "MAP({}, {})",
+                arrow_type_sql(kv[0].data_type()),
+                arrow_type_sql(kv[1].data_type())
+            ),
+            _ => "MAP".into(),
+        },
+        DataType::Dictionary(_, value) => arrow_type_sql(value),
+        other => format!("{:?}", other).to_uppercase(),
+    }
+}
+
+/// Lossless JSON encoding of one Arrow value, used when a `/query` request sets
+/// `typed_values`. Scalars that JSON can hold exactly stay numbers/booleans; decimals,
+/// temporals and intervals are strings in Arrow's canonical (ISO-8601) text form; blobs
+/// are base64; lists and structs nest.
+pub fn arrow_value_to_typed_json(array: &dyn ArrowArray, idx: usize) -> serde_json::Value {
+    if array.is_null(idx) {
+        return serde_json::Value::Null;
+    }
+    match array.data_type() {
+        DataType::Float32 | DataType::Float64 => {
+            let v = match array.data_type() {
+                DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().unwrap().value(idx) as f64,
+                _ => array.as_any().downcast_ref::<Float64Array>().unwrap().value(idx),
+            };
+            if v.is_nan() {
+                serde_json::Value::String("NaN".into())
+            } else if v.is_infinite() {
+                serde_json::Value::String(if v > 0.0 { "Infinity" } else { "-Infinity" }.into())
+            } else {
+                arrow_value_to_json(array, idx)
+            }
+        }
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Utf8
+        | DataType::LargeUtf8 => arrow_value_to_json(array, idx),
+        DataType::Binary => base64_value(array.as_any().downcast_ref::<BinaryArray>().unwrap().value(idx)),
+        DataType::LargeBinary => {
+            base64_value(array.as_any().downcast_ref::<LargeBinaryArray>().unwrap().value(idx))
+        }
+        DataType::FixedSizeBinary(_) => {
+            base64_value(array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap().value(idx))
+        }
+        DataType::List(_) => {
+            nested_list(array.as_any().downcast_ref::<ListArray>().unwrap().value(idx).as_ref())
+        }
+        DataType::LargeList(_) => {
+            nested_list(array.as_any().downcast_ref::<LargeListArray>().unwrap().value(idx).as_ref())
+        }
+        DataType::FixedSizeList(_, _) => nested_list(
+            array.as_any().downcast_ref::<FixedSizeListArray>().unwrap().value(idx).as_ref(),
+        ),
+        DataType::Struct(_) => {
+            let s = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let mut map = serde_json::Map::new();
+            for (i, name) in s.column_names().iter().enumerate() {
+                map.insert(name.to_string(), arrow_value_to_typed_json(s.column(i).as_ref(), idx));
+            }
+            serde_json::Value::Object(map)
+        }
+        DataType::Map(_, _) => {
+            let entries = array.as_any().downcast_ref::<MapArray>().unwrap().value(idx);
+            let pairs = (0..entries.len())
+                .map(|i| {
+                    let mut pair = serde_json::Map::new();
+                    pair.insert("key".into(), arrow_value_to_typed_json(entries.column(0).as_ref(), i));
+                    pair.insert("value".into(), arrow_value_to_typed_json(entries.column(1).as_ref(), i));
+                    serde_json::Value::Object(pair)
+                })
+                .collect();
+            serde_json::Value::Array(pairs)
+        }
+        DataType::Timestamp(unit, tz) => {
+            use duckdb::arrow::array::{
+                TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+                TimestampSecondArray,
+            };
+            use duckdb::arrow::datatypes::TimeUnit;
+            use duckdb::arrow::temporal_conversions::{
+                timestamp_ms_to_datetime, timestamp_ns_to_datetime, timestamp_s_to_datetime,
+                timestamp_us_to_datetime,
+            };
+            let any = array.as_any();
+            let datetime = match unit {
+                TimeUnit::Second => timestamp_s_to_datetime(any.downcast_ref::<TimestampSecondArray>().unwrap().value(idx)),
+                TimeUnit::Millisecond => timestamp_ms_to_datetime(any.downcast_ref::<TimestampMillisecondArray>().unwrap().value(idx)),
+                TimeUnit::Microsecond => timestamp_us_to_datetime(any.downcast_ref::<TimestampMicrosecondArray>().unwrap().value(idx)),
+                TimeUnit::Nanosecond => timestamp_ns_to_datetime(any.downcast_ref::<TimestampNanosecondArray>().unwrap().value(idx)),
+            };
+            match datetime {
+                // DuckDB stores TIMESTAMPTZ as a UTC instant; the zone only affects display.
+                Some(dt) => serde_json::Value::String(format!(
+                    "{}{}",
+                    dt.format("%Y-%m-%dT%H:%M:%S%.f"),
+                    if tz.is_some() { "Z" } else { "" }
+                )),
+                None => serde_json::Value::Null,
+            }
+        }
+        // Decimals, dates, times, intervals, dictionaries (ENUM): Arrow's formatter
+        // renders these exactly.
+        _ => match ArrayFormatter::try_new(array, &FormatOptions::default()) {
+            Ok(formatter) => serde_json::Value::String(formatter.value(idx).to_string()),
+            Err(_) => serde_json::Value::String(format!("[{:?}]", array.data_type())),
+        },
+    }
+}
+
+fn nested_list(values: &dyn ArrowArray) -> serde_json::Value {
+    serde_json::Value::Array(
+        (0..values.len())
+            .map(|i| arrow_value_to_typed_json(values, i))
+            .collect(),
+    )
+}
+
+fn base64_value(bytes: &[u8]) -> serde_json::Value {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    serde_json::Value::String(out)
 }
 
 fn arrow_value_to_json(array: &dyn ArrowArray, idx: usize) -> serde_json::Value {
@@ -422,5 +649,99 @@ mod tests {
             greeting,
             serde_json::Value::String("hello".to_string())
         );
+    }
+
+    fn run(sql: &str, typed_values: bool) -> QueryOutput {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("SET TimeZone = 'UTC';").unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let batches: Vec<RecordBatch> = stmt.query_arrow([]).unwrap().collect();
+        let columns = result_columns(&stmt);
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let mut map = serde_json::Map::new();
+                for (col, field) in batch.schema().fields().iter().enumerate() {
+                    let array = batch.column(col);
+                    let value = if typed_values {
+                        arrow_value_to_typed_json(array.as_ref(), row)
+                    } else {
+                        arrow_value_to_json(array.as_ref(), row)
+                    };
+                    map.insert(field.name().clone(), value);
+                }
+                rows.push(map);
+            }
+        }
+        QueryOutput { columns, rows }
+    }
+
+    const TYPED_SQL: &str = "SELECT 1.25::DECIMAL(38,9) AS num, DATE '2024-01-02' AS d, \
+        TIMESTAMPTZ '2024-01-02 03:04:05.123456+00' AS ts, TIMESTAMP '2024-01-02 03:04:05' AS dt, \
+        [1, 2] AS arr, {'x': 1, 'y': 'z'} AS st, 'hi'::BLOB AS b, count_if(true) AS c, \
+        'NaN'::DOUBLE AS nan";
+
+    #[test]
+    fn test_columns_report_duckdb_types() {
+        let out = run(TYPED_SQL, false);
+        let types: Vec<(&str, &str)> = out
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.type_name.as_str()))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                ("num", "DECIMAL(38,9)"),
+                ("d", "DATE"),
+                ("ts", "TIMESTAMP WITH TIME ZONE"),
+                ("dt", "TIMESTAMP"),
+                ("arr", "INTEGER[]"),
+                ("st", "STRUCT(\"x\" INTEGER, \"y\" VARCHAR)"),
+                ("b", "BLOB"),
+                ("c", "HUGEINT"),
+                ("nan", "DOUBLE"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_columns_present_for_empty_results() {
+        let out = run("SELECT 1 AS a, 'x' AS b WHERE false", false);
+        assert!(out.rows.is_empty());
+        assert_eq!(out.columns.len(), 2);
+        assert_eq!(out.columns[0].type_name, "INTEGER");
+    }
+
+    #[test]
+    fn test_typed_values_are_lossless() {
+        let row = &run(TYPED_SQL, true).rows[0];
+        assert_eq!(row["num"], serde_json::json!("1.250000000"));
+        assert_eq!(row["d"], serde_json::json!("2024-01-02"));
+        assert_eq!(row["ts"], serde_json::json!("2024-01-02T03:04:05.123456Z"));
+        assert_eq!(row["dt"], serde_json::json!("2024-01-02T03:04:05"));
+        assert_eq!(row["arr"], serde_json::json!([1, 2]));
+        assert_eq!(row["st"], serde_json::json!({"x": 1, "y": "z"}));
+        assert_eq!(row["b"], serde_json::json!("aGk="));
+        assert_eq!(row["c"], serde_json::json!("1"));
+        assert_eq!(row["nan"], serde_json::json!("NaN"));
+    }
+
+    #[test]
+    fn test_untyped_values_keep_the_legacy_encoding() {
+        // Existing /query callers (floci S3 Select) must see exactly the old output.
+        let row = &run(TYPED_SQL, false).rows[0];
+        assert_eq!(row["num"], serde_json::json!(1.25));
+        assert_eq!(row["d"], serde_json::json!("[Date32]"));
+        assert!(row["arr"].as_str().unwrap().starts_with("[List("));
+        assert_eq!(row["nan"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_base64() {
+        assert_eq!(base64_value(b""), serde_json::json!(""));
+        assert_eq!(base64_value(b"f"), serde_json::json!("Zg=="));
+        assert_eq!(base64_value(b"fo"), serde_json::json!("Zm8="));
+        assert_eq!(base64_value(b"foo"), serde_json::json!("Zm9v"));
     }
 }
