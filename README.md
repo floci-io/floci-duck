@@ -81,6 +81,7 @@ Executes a SQL query and returns the result rows as a JSON array. Useful for rea
 | `s3_url_style` | String (Optional) | `path` or `vhost`. Default: `path`. |
 | `setup_sql` | String (Optional) | SQL executed before the main query — use it to create views, temp tables, or load extensions. |
 | `typed_values` | Boolean (Optional) | Encode row values losslessly (see below). Default: `false`. |
+| `followup_sql` | String (Optional) | A second statement run after `sql` in the same session; its result is returned as `followup` (`{ "columns": [...], "rows": [...] }`). Useful to read a table a DML statement just changed. |
 
 #### Response Body
 

@@ -81,6 +81,7 @@ pub async fn handle_query(
                     status: "success".to_string(),
                     columns: Some(output.columns),
                     rows: Some(output.rows),
+                    followup: output.followup,
                     message: None,
                 }))
             }
@@ -90,6 +91,7 @@ pub async fn handle_query(
                     status: "error".to_string(),
                     columns: None,
                     rows: None,
+                    followup: None,
                     message: Some(e.to_string()),
                 }))
             }
@@ -99,6 +101,7 @@ pub async fn handle_query(
                     status: "error".to_string(),
                     columns: None,
                     rows: None,
+                    followup: None,
                     message: Some("Internal error".to_string()),
                 }))
             }

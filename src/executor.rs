@@ -1,4 +1,4 @@
-use crate::models::{Column, ExecuteRequest, QueryRequest};
+use crate::models::{Column, ExecuteRequest, QueryRequest, QueryResult};
 use duckdb::arrow::array::{
     Array as ArrowArray, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
@@ -168,10 +168,12 @@ pub fn execute_query(req: ExecuteRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Result of `/query`: the column names and DuckDB types, plus the rows.
+/// Result of `/query`: the column names and DuckDB types, plus the rows, and the
+/// result of the optional follow-up statement.
 pub struct QueryOutput {
     pub columns: Vec<Column>,
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub followup: Option<QueryResult>,
 }
 
 /// Query executor that returns rows as JSON maps, used by S3 Select and BigQuery.
@@ -209,12 +211,34 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
     }
 
     info!("Executing query SQL: {}", req.sql);
-    let mut stmt = conn.prepare(&req.sql)?;
+    let (columns, rows) = run_statement(&conn, &req.sql, req.typed_values)?;
+    info!("Query returned {} rows", rows.len());
+
+    let followup = match &req.followup_sql {
+        Some(sql) if !sql.trim().is_empty() => {
+            info!("Executing follow-up SQL: {}", sql);
+            let (columns, rows) = run_statement(&conn, sql, req.typed_values)?;
+            Some(QueryResult { columns, rows })
+        }
+        _ => None,
+    };
+
+    Ok(QueryOutput {
+        columns,
+        rows,
+        followup,
+    })
+}
+
+type Rows = Vec<serde_json::Map<String, serde_json::Value>>;
+
+/// Runs one statement and returns its result columns and rows.
+fn run_statement(conn: &Connection, sql: &str, typed_values: bool) -> anyhow::Result<(Vec<Column>, Rows)> {
+    let mut stmt = conn.prepare(sql)?;
     let batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
+    let columns = with_described_types(conn, sql, result_columns(&stmt));
 
-    let columns = with_described_types(&conn, &req.sql, result_columns(&stmt));
-
-    let mut result = Vec::new();
+    let mut rows = Vec::new();
     for batch in &batches {
         let field_names: Vec<String> = batch
             .schema()
@@ -227,22 +251,17 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
             let mut map = serde_json::Map::new();
             for (col_idx, name) in field_names.iter().enumerate() {
                 let col = batch.column(col_idx);
-                let value = if req.typed_values {
+                let value = if typed_values {
                     arrow_value_to_typed_json(col.as_ref(), row_idx)
                 } else {
                     arrow_value_to_json(col.as_ref(), row_idx)
                 };
                 map.insert(name.clone(), value);
             }
-            result.push(map);
+            rows.push(map);
         }
     }
-
-    info!("Query returned {} rows", result.len());
-    Ok(QueryOutput {
-        columns,
-        rows: result,
-    })
+    Ok((columns, rows))
 }
 
 /**
@@ -696,7 +715,7 @@ mod tests {
                 rows.push(map);
             }
         }
-        QueryOutput { columns, rows }
+        QueryOutput { columns, rows, followup: None }
     }
 
     const TYPED_SQL: &str = "SELECT 1.25::DECIMAL(38,9) AS num, DATE '2024-01-02' AS d, \
@@ -776,6 +795,20 @@ mod tests {
         assert_eq!(row["d"], serde_json::json!("[Date32]"));
         assert!(row["arr"].as_str().unwrap().starts_with("[List("));
         assert_eq!(row["nan"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_followup_sees_the_changes_of_the_first_statement() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(id, name);")
+            .unwrap();
+        let (columns, rows) = run_statement(&conn, "UPDATE t SET name = 'x' WHERE id = 2", true).unwrap();
+        assert_eq!(columns[0].name, "Count");
+        assert_eq!(rows[0]["Count"], serde_json::json!(1));
+
+        let (columns, rows) = run_statement(&conn, "SELECT * FROM t ORDER BY id", true).unwrap();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(rows[1]["name"], serde_json::json!("x"));
     }
 
     #[test]

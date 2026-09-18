@@ -40,6 +40,16 @@ pub struct QueryRequest {
     /// unchanged output.
     #[serde(default)]
     pub typed_values: bool,
+    /// Optional statement run after `sql` in the same connection; its result is returned
+    /// as `followup`. Lets a caller read state a DML statement just changed.
+    pub followup_sql: Option<String>,
+}
+
+/// Columns and rows of one statement's result.
+#[derive(Serialize)]
+pub struct QueryResult {
+    pub columns: Vec<Column>,
+    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A result column: its name and DuckDB SQL type, as `DESCRIBE` would print it.
@@ -57,6 +67,8 @@ pub struct QueryResponse {
     pub columns: Option<Vec<Column>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followup: Option<QueryResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
