@@ -1,4 +1,4 @@
-use crate::models::{Column, ExecuteRequest, QueryRequest, QueryResult};
+use crate::models::{ArrowIpc, ArrowIpcBatch, Column, ExecuteRequest, QueryRequest, QueryResult};
 use duckdb::arrow::array::{
     Array as ArrowArray, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
@@ -174,6 +174,7 @@ pub struct QueryOutput {
     pub columns: Vec<Column>,
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     pub followup: Option<QueryResult>,
+    pub arrow: Option<ArrowIpc>,
 }
 
 /// Query executor that returns rows as JSON maps, used by S3 Select and BigQuery.
@@ -211,7 +212,13 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
     }
 
     info!("Executing query SQL: {}", req.sql);
-    let (columns, rows) = run_statement(&conn, &req.sql, req.typed_values)?;
+    let (columns, rows, arrow) = if req.arrow_ipc {
+        let (columns, arrow) = run_statement_arrow(&conn, &req.sql)?;
+        (columns, Vec::new(), Some(arrow))
+    } else {
+        let (columns, rows) = run_statement(&conn, &req.sql, req.typed_values)?;
+        (columns, rows, None)
+    };
     info!("Query returned {} rows", rows.len());
 
     let followup = match &req.followup_sql {
@@ -227,7 +234,53 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
         columns,
         rows,
         followup,
+        arrow,
     })
+}
+
+/// Runs one statement and returns its result as Arrow IPC messages instead of JSON rows.
+fn run_statement_arrow(conn: &Connection, sql: &str) -> anyhow::Result<(Vec<Column>, ArrowIpc)> {
+    use arrow_ipc::writer::{
+        write_message, CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
+    let schema = stmt.schema();
+    let columns = with_described_types(conn, sql, result_columns(&stmt));
+
+    let generator = IpcDataGenerator::default();
+    let options = IpcWriteOptions::default();
+    let mut tracker = DictionaryTracker::new(false);
+    let mut compression = CompressionContext::default();
+
+    let mut schema_bytes = Vec::new();
+    let encoded_schema = generator.schema_to_bytes_with_dictionary_tracker(&schema, &mut tracker, &options);
+    write_message(&mut schema_bytes, encoded_schema, &options)?;
+
+    let mut encoded_batches = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let (dictionaries, encoded) = generator.encode(batch, &mut tracker, &options, &mut compression)?;
+        let mut data = Vec::new();
+        for dictionary in dictionaries {
+            write_message(&mut data, dictionary, &options)?;
+        }
+        write_message(&mut data, encoded, &options)?;
+        encoded_batches.push(ArrowIpcBatch {
+            data: base64_string(&data),
+            row_count: batch.num_rows(),
+        });
+    }
+    Ok((
+        columns,
+        ArrowIpc {
+            schema: base64_string(&schema_bytes),
+            batches: encoded_batches,
+        },
+    ))
 }
 
 type Rows = Vec<serde_json::Map<String, serde_json::Value>>;
@@ -483,6 +536,13 @@ fn nested_list(values: &dyn ArrowArray) -> serde_json::Value {
     )
 }
 
+fn base64_string(bytes: &[u8]) -> String {
+    match base64_value(bytes) {
+        serde_json::Value::String(s) => s,
+        _ => unreachable!(),
+    }
+}
+
 fn base64_value(bytes: &[u8]) -> serde_json::Value {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -715,7 +775,7 @@ mod tests {
                 rows.push(map);
             }
         }
-        QueryOutput { columns, rows, followup: None }
+        QueryOutput { columns, rows, followup: None, arrow: None }
     }
 
     const TYPED_SQL: &str = "SELECT 1.25::DECIMAL(38,9) AS num, DATE '2024-01-02' AS d, \
@@ -809,6 +869,45 @@ mod tests {
         let (columns, rows) = run_statement(&conn, "SELECT * FROM t ORDER BY id", true).unwrap();
         assert_eq!(columns.len(), 2);
         assert_eq!(rows[1]["name"], serde_json::json!("x"));
+    }
+
+    #[test]
+    fn test_arrow_ipc_messages_round_trip() {
+        use duckdb::arrow::datatypes::DataType as DT;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("SET TimeZone = 'UTC';").unwrap();
+        let (columns, arrow) = run_statement_arrow(&conn,
+            "SELECT * FROM (VALUES (1::BIGINT, 'a', TIMESTAMPTZ '2024-01-02 03:04:05+00'), \
+             (2, 'b', NULL)) v(id, name, ts)").unwrap();
+        assert_eq!(columns.len(), 3);
+        assert_eq!(arrow.batches.iter().map(|b| b.row_count).sum::<usize>(), 2);
+        // Every message is an encapsulated IPC message: continuation marker, then metadata length.
+        let schema = decode_base64(&arrow.schema);
+        assert_eq!(&schema[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        let parsed = arrow_ipc::convert::try_schema_from_ipc_buffer(&schema).unwrap();
+        assert_eq!(parsed.field(0).data_type(), &DT::Int64);
+        assert_eq!(parsed.field(2).data_type(),
+            &DT::Timestamp(duckdb::arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())));
+        let batch = decode_base64(&arrow.batches[0].data);
+        assert_eq!(&batch[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    fn decode_base64(text: &str) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut buffer = 0u32;
+        let mut bits = 0;
+        for byte in text.bytes().filter(|b| *b != b'=') {
+            let value = ALPHABET.iter().position(|c| *c == byte).unwrap() as u32;
+            buffer = (buffer << 6) | value;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buffer >> bits) as u8);
+                buffer &= (1 << bits) - 1;
+            }
+        }
+        out
     }
 
     #[test]

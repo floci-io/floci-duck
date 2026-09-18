@@ -43,6 +43,23 @@ pub struct QueryRequest {
     /// Optional statement run after `sql` in the same connection; its result is returned
     /// as `followup`. Lets a caller read state a DML statement just changed.
     pub followup_sql: Option<String>,
+    /// When true, the `sql` result is also returned as Arrow IPC messages in `arrow`.
+    #[serde(default)]
+    pub arrow_ipc: bool,
+}
+
+/// A result as Arrow IPC: one encapsulated schema message and one encapsulated record batch
+/// message per batch, each base64-encoded.
+#[derive(Serialize)]
+pub struct ArrowIpc {
+    pub schema: String,
+    pub batches: Vec<ArrowIpcBatch>,
+}
+
+#[derive(Serialize)]
+pub struct ArrowIpcBatch {
+    pub data: String,
+    pub row_count: usize,
 }
 
 /// Columns and rows of one statement's result.
@@ -69,6 +86,8 @@ pub struct QueryResponse {
     pub rows: Option<Vec<serde_json::Map<String, serde_json::Value>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub followup: Option<QueryResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrow: Option<ArrowIpc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }

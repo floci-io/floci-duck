@@ -82,6 +82,7 @@ pub async fn handle_query(
                     columns: Some(output.columns),
                     rows: Some(output.rows),
                     followup: output.followup,
+                    arrow: output.arrow,
                     message: None,
                 }))
             }
@@ -92,6 +93,7 @@ pub async fn handle_query(
                     columns: None,
                     rows: None,
                     followup: None,
+                    arrow: None,
                     message: Some(e.to_string()),
                 }))
             }
@@ -102,6 +104,7 @@ pub async fn handle_query(
                     columns: None,
                     rows: None,
                     followup: None,
+                    arrow: None,
                     message: Some("Internal error".to_string()),
                 }))
             }

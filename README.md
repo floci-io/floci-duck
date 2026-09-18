@@ -82,6 +82,7 @@ Executes a SQL query and returns the result rows as a JSON array. Useful for rea
 | `setup_sql` | String (Optional) | SQL executed before the main query — use it to create views, temp tables, or load extensions. |
 | `typed_values` | Boolean (Optional) | Encode row values losslessly (see below). Default: `false`. |
 | `followup_sql` | String (Optional) | A second statement run after `sql` in the same session; its result is returned as `followup` (`{ "columns": [...], "rows": [...] }`). Useful to read a table a DML statement just changed. |
+| `arrow_ipc` | Boolean (Optional) | Return the `sql` result as Arrow IPC instead of JSON rows: `arrow.schema` is a base64 encapsulated IPC schema message and each `arrow.batches[i].data` a base64 encapsulated record batch message (with its `row_count`). `rows` is empty. |
 
 #### Response Body
 
