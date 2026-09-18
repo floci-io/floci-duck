@@ -212,7 +212,7 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
     let mut stmt = conn.prepare(&req.sql)?;
     let batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
 
-    let columns = result_columns(&stmt);
+    let columns = with_described_types(&conn, &req.sql, result_columns(&stmt));
 
     let mut result = Vec::new();
     for batch in &batches {
@@ -243,6 +243,29 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
         columns,
         rows: result,
     })
+}
+
+/**
+ * Replaces the Arrow-derived type names with the exact ones `DESCRIBE` reports (Arrow folds
+ * aliases such as `JSON` into `VARCHAR`). `DESCRIBE` only binds the query, so this costs no
+ * execution; statements it cannot describe (DML, DDL) keep the Arrow-derived names.
+ */
+fn with_described_types(conn: &Connection, sql: &str, columns: Vec<Column>) -> Vec<Column> {
+    let described: Option<Vec<(String, String)>> = (|| {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {}", sql)).ok()?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .ok()?;
+        rows.collect::<Result<Vec<_>, _>>().ok()
+    })();
+    match described {
+        Some(described) if described.len() == columns.len() => columns
+            .into_iter()
+            .zip(described)
+            .map(|(column, (_, type_name))| Column { name: column.name, type_name })
+            .collect(),
+        _ => columns,
+    }
 }
 
 fn result_columns(stmt: &duckdb::Statement<'_>) -> Vec<Column> {
@@ -703,6 +726,24 @@ mod tests {
                 ("nan", "DOUBLE"),
             ]
         );
+    }
+
+    #[test]
+    fn test_described_types_keep_type_aliases() {
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = "SELECT '{\"a\": 1}'::JSON AS j, 1::HUGEINT AS h, 'x' AS s";
+        let mut stmt = conn.prepare(sql).unwrap();
+        let _: Vec<RecordBatch> = stmt.query_arrow([]).unwrap().collect();
+        let columns = with_described_types(&conn, sql, result_columns(&stmt));
+        let types: Vec<&str> = columns.iter().map(|c| c.type_name.as_str()).collect();
+        assert_eq!(types, vec!["JSON", "HUGEINT", "VARCHAR"]);
+
+        // DML cannot be described; the Arrow-derived names remain.
+        conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        let mut insert = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+        let _: Vec<RecordBatch> = insert.query_arrow([]).unwrap().collect();
+        let columns = with_described_types(&conn, "INSERT INTO t VALUES (1)", result_columns(&insert));
+        assert_eq!(columns[0].type_name, "BIGINT");
     }
 
     #[test]
