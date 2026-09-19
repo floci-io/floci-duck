@@ -1,5 +1,5 @@
 # Stage 1: Builder
-FROM rust:slim-bookworm AS builder
+FROM rust:slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -21,7 +21,7 @@ RUN cargo build --release
 RUN strip target/release/floci-duck
 
 # Stage 2: Final
-FROM gcr.io/distroless/cc-debian12
+FROM gcr.io/distroless/cc-debian13
 
 # Copy the binary
 COPY --from=builder --chmod=0755 /usr/src/floci-duck/target/release/floci-duck /floci-duck
