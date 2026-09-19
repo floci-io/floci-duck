@@ -27,11 +27,15 @@
     "s3_url_style": "string (optional)",
     "output_s3_path": "string (optional)",
     "setup_sql": "string (optional)",
+    "typed_values": "bool (optional, /query)",
+    "followup_sql": "string (optional, /query)",
+    "arrow_ipc": "bool (optional, /query)",
     "variables": { "key": "value" }
   }
   ```
 - **Athena Mode:** Triggered by `output_s3_path`. Automatically wraps the SQL in a `COPY (...) TO 'path' (FORMAT CSV, HEADER);` statement.
 - **Firehose Mode:** Triggered when `output_s3_path` is absent. Executes the SQL exactly as provided.
+- **`/query` results:** responses list `columns` (name and exact DuckDB type from `DESCRIBE`). `typed_values` encodes values losslessly, `followup_sql` runs a second statement in the same session and returns it as `followup`, and `arrow_ipc` returns base64 Arrow IPC messages in `arrow` instead of JSON rows. See the README for the encodings.
 - **Variable substitution:** `{{key}}` placeholders in `sql` and `setup_sql` are replaced with values from the `variables` map before execution.
 
 ## Build & Deployment

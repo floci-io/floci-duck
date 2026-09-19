@@ -173,6 +173,51 @@ EOF
     body=$(check_ok "setup_sql creates view before query" "$raw")
     vinfo "rows: $(echo "$body" | jq '.rows')"
 
+    # columns report exact DuckDB types, even without rows
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT 1::INTEGER AS id, '{}'::JSON AS doc WHERE false",$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "columns carry DuckDB types" "$raw")
+    local types; types=$(echo "$body" | jq -c '[.columns[].type]')
+    info "types: $types (expected [\"INTEGER\",\"JSON\"])"
+    [[ "$types" == '["INTEGER","JSON"]' ]] || fail "  column types mismatch"
+
+    # typed_values encodes decimals, dates and nested values losslessly
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT 1.25::DECIMAL(38,9) AS d, DATE '2024-01-02' AS day, [1, 2] AS xs","typed_values":true,$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "typed_values" "$raw")
+    local row; row=$(echo "$body" | jq -c '.rows[0]')
+    info "row: $row"
+    [[ "$row" == '{"d":"1.250000000","day":"2024-01-02","xs":[1,2]}' ]] || fail "  typed row mismatch"
+
+    # followup_sql reads the table the main statement changed, in the same session
+    raw=$(post_query "$(cat <<EOF
+{
+  "setup_sql": "CREATE TABLE t AS SELECT * FROM range(3) r(x);",
+  "sql": "DELETE FROM t WHERE x = 0",
+  "followup_sql": "SELECT count(*) AS n FROM t",
+  $(s3_fields)
+}
+EOF
+)")
+    body=$(check_ok "followup_sql" "$raw")
+    local left; left=$(echo "$body" | jq '.followup.rows[0].n')
+    info "rows left: $left (expected 2)"
+    [[ "$left" -eq 2 ]] || fail "  followup result mismatch"
+
+    # arrow_ipc returns base64 IPC messages instead of JSON rows
+    raw=$(post_query "$(cat <<EOF
+{"sql":"SELECT val FROM range(5) t(val)","arrow_ipc":true,$(s3_fields)}
+EOF
+)")
+    body=$(check_ok "arrow_ipc" "$raw")
+    local arrow_rows; arrow_rows=$(echo "$body" | jq '[.arrow.batches[].row_count] | add')
+    info "arrow rows: $arrow_rows (expected 5)"
+    [[ "$arrow_rows" -eq 5 ]] || fail "  arrow row count mismatch"
+
     # x-correlation-id
     raw=$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/query" \
         -H "Content-Type: application/json" \

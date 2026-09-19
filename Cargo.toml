@@ -14,6 +14,8 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = "1.0.86"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
+# Arrow IPC framing for /query responses (duckdb-rs builds arrow without the ipc feature).
+arrow-ipc = { version = "58", default-features = false }
 
 [profile.release]
 opt-level = "z"

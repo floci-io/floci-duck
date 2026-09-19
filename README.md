@@ -80,12 +80,20 @@ Executes a SQL query and returns the result rows as a JSON array. Useful for rea
 | `s3_use_ssl` | Boolean (Optional) | Use SSL. Auto-detected from the endpoint scheme if omitted. |
 | `s3_url_style` | String (Optional) | `path` or `vhost`. Default: `path`. |
 | `setup_sql` | String (Optional) | SQL executed before the main query — use it to create views, temp tables, or load extensions. |
+| `typed_values` | Boolean (Optional) | Encode row values losslessly (see below). Default: `false`. |
+| `followup_sql` | String (Optional) | A second statement run after `sql` in the same session; its result is returned as `followup` (`{ "columns": [...], "rows": [...] }`). Useful to read a table a DML statement just changed. |
+| `arrow_ipc` | Boolean (Optional) | Return the `sql` result as Arrow IPC instead of JSON rows: `arrow.schema` is a base64 encapsulated IPC schema message and each `arrow.batches[i].data` a base64 encapsulated record batch message (with its `row_count`). `rows` is empty. |
 
 #### Response Body
 
 ```json
 {
   "status": "success",
+  "columns": [
+    { "name": "id", "type": "INTEGER" },
+    { "name": "name", "type": "VARCHAR" },
+    { "name": "amount", "type": "DECIMAL(10,2)" }
+  ],
   "rows": [
     { "id": 1, "name": "Alice", "amount": 99.5 },
     { "id": 2, "name": "Bob",   "amount": 150.0 }
@@ -93,7 +101,31 @@ Executes a SQL query and returns the result rows as a JSON array. Useful for rea
 }
 ```
 
-On error, `status` is `"error"` and `message` contains the details. The `rows` field is omitted on error.
+`columns` lists every result column in order, with its DuckDB SQL type as `DESCRIBE` prints it
+(`DECIMAL(38,9)`, `TIMESTAMP WITH TIME ZONE`, `INTEGER[]`, `STRUCT("x" INTEGER)`, ...). It is
+present even when the query returns no rows.
+
+On error, `status` is `"error"` and `message` contains the details. The `columns` and `rows` fields are omitted on error.
+
+#### Value encoding
+
+By default, values keep the original encoding: numbers and strings as JSON scalars, decimals as
+JSON numbers (floating point), and dates, timestamps, intervals, lists and structs as a
+placeholder naming their Arrow type. Existing callers rely on this, so it does not change.
+
+With `"typed_values": true`, every value is encoded without loss:
+
+| DuckDB type | JSON value |
+| :--- | :--- |
+| integers, `BOOLEAN`, `VARCHAR` | number, boolean, string |
+| `FLOAT`, `DOUBLE` | number; `"NaN"`, `"Infinity"`, `"-Infinity"` for non-finite values |
+| `DECIMAL`, `HUGEINT` | exact decimal string, e.g. `"1.250000000"` |
+| `DATE`, `TIME` | `"2024-01-02"`, `"03:04:05.123456"` |
+| `TIMESTAMP` | ISO-8601 without offset, e.g. `"2024-01-02T03:04:05.5"` |
+| `TIMESTAMP WITH TIME ZONE` | ISO-8601 UTC instant, e.g. `"2024-01-02T03:04:05.5Z"` |
+| `BLOB` | base64 string |
+| `LIST`, `STRUCT` | JSON array, JSON object (nested values follow the same rules) |
+| `MAP` | array of `{"key": ..., "value": ...}` |
 
 #### Example: Read a Parquet file from S3
 
@@ -268,7 +300,7 @@ make dev-infra
 | :--- | :--- |
 | `init` | Creates the S3 bucket and lists resources |
 | `health` | Server liveness (`GET /health`) |
-| `query` | `/query` endpoint — basic SELECT, NULLs, numeric types, `setup_sql`, correlation ID, error handling |
+| `query` | `/query` endpoint — basic SELECT, NULLs, numeric types, column types, `setup_sql`, `typed_values`, `followup_sql`, `arrow_ipc`, correlation ID, error handling |
 | `execute` | `/execute` endpoint — firehose mode, athena mode (CSV → S3), variable substitution |
 | `parquet` | Full S3 round-trip: write Parquet, SELECT *, filter, aggregate, DESCRIBE schema |
 | `http` | `httpfs` extension loads and S3 settings are applied |
