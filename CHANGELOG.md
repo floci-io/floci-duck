@@ -1,3 +1,10 @@
+# [0.3.0](https://github.com/floci-io/floci-duck/compare/0.2.0...0.3.0) (2026-09-19)
+
+
+### Features
+
+* typed results, follow-up statements and Arrow IPC for /query ([#3](https://github.com/floci-io/floci-duck/issues/3)) ([b6668aa](https://github.com/floci-io/floci-duck/commit/b6668aaefaea939390f4695cda01d5288259ba05))
+
 # [0.2.0](https://github.com/floci-io/floci-duck/compare/0.1.5...0.2.0) (2026-05-13)
 
 
