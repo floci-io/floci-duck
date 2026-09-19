@@ -300,7 +300,7 @@ make dev-infra
 | :--- | :--- |
 | `init` | Creates the S3 bucket and lists resources |
 | `health` | Server liveness (`GET /health`) |
-| `query` | `/query` endpoint — basic SELECT, NULLs, numeric types, `setup_sql`, correlation ID, error handling |
+| `query` | `/query` endpoint — basic SELECT, NULLs, numeric types, column types, `setup_sql`, `typed_values`, `followup_sql`, `arrow_ipc`, correlation ID, error handling |
 | `execute` | `/execute` endpoint — firehose mode, athena mode (CSV → S3), variable substitution |
 | `parquet` | Full S3 round-trip: write Parquet, SELECT *, filter, aggregate, DESCRIBE schema |
 | `http` | `httpfs` extension loads and S3 settings are applied |
