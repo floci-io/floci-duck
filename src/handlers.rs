@@ -1,8 +1,11 @@
-use axum::{http::{HeaderMap, StatusCode}, Json};
+use crate::executor::{execute_query, execute_query_returning};
+use crate::models::{ExecuteRequest, ExecuteResponse, QueryRequest, QueryResponse};
+use axum::{
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use tracing::{error, info, info_span, Instrument, Span};
 use uuid::Uuid;
-use crate::models::{ExecuteRequest, ExecuteResponse, QueryRequest, QueryResponse};
-use crate::executor::{execute_query, execute_query_returning};
 
 pub async fn handle_execute(
     headers: HeaderMap,
@@ -23,29 +26,39 @@ pub async fn handle_execute(
         let result = tokio::task::spawn_blocking(move || {
             let _guard = span.enter();
             execute_query(req)
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(_)) => {
                 info!("Query executed successfully");
-                (StatusCode::OK, Json(ExecuteResponse {
-                    status: "success".to_string(),
-                    message: None,
-                }))
+                (
+                    StatusCode::OK,
+                    Json(ExecuteResponse {
+                        status: "success".to_string(),
+                        message: None,
+                    }),
+                )
             }
             Ok(Err(e)) => {
                 error!("Query execution failed: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ExecuteResponse {
-                    status: "error".to_string(),
-                    message: Some(e.to_string()),
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ExecuteResponse {
+                        status: "error".to_string(),
+                        message: Some(e.to_string()),
+                    }),
+                )
             }
             Err(e) => {
                 error!("Query task panicked: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ExecuteResponse {
-                    status: "error".to_string(),
-                    message: Some("Internal error".to_string()),
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ExecuteResponse {
+                        status: "error".to_string(),
+                        message: Some("Internal error".to_string()),
+                    }),
+                )
             }
         }
     }
@@ -72,41 +85,51 @@ pub async fn handle_query(
         let result = tokio::task::spawn_blocking(move || {
             let _guard = span.enter();
             execute_query_returning(req)
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(output)) => {
                 info!("Query returned {} rows", output.rows.len());
-                (StatusCode::OK, Json(QueryResponse {
-                    status: "success".to_string(),
-                    columns: Some(output.columns),
-                    rows: Some(output.rows),
-                    followup: output.followup,
-                    arrow: output.arrow,
-                    message: None,
-                }))
+                (
+                    StatusCode::OK,
+                    Json(QueryResponse {
+                        status: "success".to_string(),
+                        columns: Some(output.columns),
+                        rows: Some(output.rows),
+                        followup: output.followup,
+                        arrow: output.arrow,
+                        message: None,
+                    }),
+                )
             }
             Ok(Err(e)) => {
                 error!("Query execution failed: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(QueryResponse {
-                    status: "error".to_string(),
-                    columns: None,
-                    rows: None,
-                    followup: None,
-                    arrow: None,
-                    message: Some(e.to_string()),
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(QueryResponse {
+                        status: "error".to_string(),
+                        columns: None,
+                        rows: None,
+                        followup: None,
+                        arrow: None,
+                        message: Some(e.to_string()),
+                    }),
+                )
             }
             Err(e) => {
                 error!("Query task panicked: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(QueryResponse {
-                    status: "error".to_string(),
-                    columns: None,
-                    rows: None,
-                    followup: None,
-                    arrow: None,
-                    message: Some("Internal error".to_string()),
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(QueryResponse {
+                        status: "error".to_string(),
+                        columns: None,
+                        rows: None,
+                        followup: None,
+                        arrow: None,
+                        message: Some("Internal error".to_string()),
+                    }),
+                )
             }
         }
     }

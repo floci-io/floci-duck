@@ -29,7 +29,10 @@ fn open_conn() -> anyhow::Result<Connection> {
     let conn = Connection::open_in_memory()?;
     if let Ok(ext_dir) = env::var("FLOCI_DUCK_EXT_DIR") {
         info!("Setting extension directory to: {}", ext_dir);
-        conn.execute_batch(&format!("SET extension_directory = '{}';", escape_sql(&ext_dir)))?;
+        conn.execute_batch(&format!(
+            "SET extension_directory = '{}';",
+            escape_sql(&ext_dir)
+        ))?;
     }
     Ok(conn)
 }
@@ -61,7 +64,10 @@ fn setup_s3(
         .trim_start_matches("https://")
         .trim_start_matches("http://");
 
-    info!("Configuring S3: endpoint={}, region={}", endpoint, s3_region);
+    info!(
+        "Configuring S3: endpoint={}, region={}",
+        endpoint, s3_region
+    );
     conn.execute_batch(&format!(
         "SET s3_endpoint = '{}';
          SET s3_region = '{}';
@@ -255,7 +261,8 @@ fn run_statement_arrow(conn: &Connection, sql: &str) -> anyhow::Result<(Vec<Colu
     let mut compression = CompressionContext::default();
 
     let mut schema_bytes = Vec::new();
-    let encoded_schema = generator.schema_to_bytes_with_dictionary_tracker(&schema, &mut tracker, &options);
+    let encoded_schema =
+        generator.schema_to_bytes_with_dictionary_tracker(&schema, &mut tracker, &options);
     write_message(&mut schema_bytes, encoded_schema, &options)?;
 
     let mut encoded_batches = Vec::with_capacity(batches.len());
@@ -263,7 +270,8 @@ fn run_statement_arrow(conn: &Connection, sql: &str) -> anyhow::Result<(Vec<Colu
         if batch.num_rows() == 0 {
             continue;
         }
-        let (dictionaries, encoded) = generator.encode(batch, &mut tracker, &options, &mut compression)?;
+        let (dictionaries, encoded) =
+            generator.encode(batch, &mut tracker, &options, &mut compression)?;
         let mut data = Vec::new();
         for dictionary in dictionaries {
             write_message(&mut data, dictionary, &options)?;
@@ -286,7 +294,11 @@ fn run_statement_arrow(conn: &Connection, sql: &str) -> anyhow::Result<(Vec<Colu
 type Rows = Vec<serde_json::Map<String, serde_json::Value>>;
 
 /// Runs one statement and returns its result columns and rows.
-fn run_statement(conn: &Connection, sql: &str, typed_values: bool) -> anyhow::Result<(Vec<Column>, Rows)> {
+fn run_statement(
+    conn: &Connection,
+    sql: &str,
+    typed_values: bool,
+) -> anyhow::Result<(Vec<Column>, Rows)> {
     let mut stmt = conn.prepare(sql)?;
     let batches: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
     let columns = with_described_types(conn, sql, result_columns(&stmt));
@@ -326,7 +338,9 @@ fn with_described_types(conn: &Connection, sql: &str, columns: Vec<Column>) -> V
     let described: Option<Vec<(String, String)>> = (|| {
         let mut stmt = conn.prepare(&format!("DESCRIBE {}", sql)).ok()?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .ok()?;
         rows.collect::<Result<Vec<_>, _>>().ok()
     })();
@@ -334,7 +348,10 @@ fn with_described_types(conn: &Connection, sql: &str, columns: Vec<Column>) -> V
         Some(described) if described.len() == columns.len() => columns
             .into_iter()
             .zip(described)
-            .map(|(column, (_, type_name))| Column { name: column.name, type_name })
+            .map(|(column, (_, type_name))| Column {
+                name: column.name,
+                type_name,
+            })
             .collect(),
         _ => columns,
     }
@@ -387,9 +404,10 @@ fn arrow_type_sql(t: &DataType) -> String {
         DataType::Float64 => "DOUBLE".into(),
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("DECIMAL({},{})", p, s),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR".into(),
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_) => {
-            "BLOB".into()
-        }
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "BLOB".into(),
         DataType::Date32 | DataType::Date64 => "DATE".into(),
         DataType::Time32(_) | DataType::Time64(_) => "TIME".into(),
         DataType::Timestamp(_, Some(_)) => "TIMESTAMP WITH TIME ZONE".into(),
@@ -406,7 +424,13 @@ fn arrow_type_sql(t: &DataType) -> String {
         DataType::Struct(fields) => {
             let parts: Vec<String> = fields
                 .iter()
-                .map(|f| format!("\"{}\" {}", f.name().replace('"', "\"\""), arrow_type_sql(f.data_type())))
+                .map(|f| {
+                    format!(
+                        "\"{}\" {}",
+                        f.name().replace('"', "\"\""),
+                        arrow_type_sql(f.data_type())
+                    )
+                })
                 .collect();
             format!("STRUCT({})", parts.join(", "))
         }
@@ -434,8 +458,16 @@ pub fn arrow_value_to_typed_json(array: &dyn ArrowArray, idx: usize) -> serde_js
     match array.data_type() {
         DataType::Float32 | DataType::Float64 => {
             let v = match array.data_type() {
-                DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().unwrap().value(idx) as f64,
-                _ => array.as_any().downcast_ref::<Float64Array>().unwrap().value(idx),
+                DataType::Float32 => array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(idx) as f64,
+                _ => array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(idx),
             };
             if v.is_nan() {
                 serde_json::Value::String("NaN".into())
@@ -456,37 +488,79 @@ pub fn arrow_value_to_typed_json(array: &dyn ArrowArray, idx: usize) -> serde_js
         | DataType::UInt64
         | DataType::Utf8
         | DataType::LargeUtf8 => arrow_value_to_json(array, idx),
-        DataType::Binary => base64_value(array.as_any().downcast_ref::<BinaryArray>().unwrap().value(idx)),
-        DataType::LargeBinary => {
-            base64_value(array.as_any().downcast_ref::<LargeBinaryArray>().unwrap().value(idx))
-        }
-        DataType::FixedSizeBinary(_) => {
-            base64_value(array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap().value(idx))
-        }
-        DataType::List(_) => {
-            nested_list(array.as_any().downcast_ref::<ListArray>().unwrap().value(idx).as_ref())
-        }
-        DataType::LargeList(_) => {
-            nested_list(array.as_any().downcast_ref::<LargeListArray>().unwrap().value(idx).as_ref())
-        }
+        DataType::Binary => base64_value(
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(idx),
+        ),
+        DataType::LargeBinary => base64_value(
+            array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .value(idx),
+        ),
+        DataType::FixedSizeBinary(_) => base64_value(
+            array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .value(idx),
+        ),
+        DataType::List(_) => nested_list(
+            array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value(idx)
+                .as_ref(),
+        ),
+        DataType::LargeList(_) => nested_list(
+            array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .unwrap()
+                .value(idx)
+                .as_ref(),
+        ),
         DataType::FixedSizeList(_, _) => nested_list(
-            array.as_any().downcast_ref::<FixedSizeListArray>().unwrap().value(idx).as_ref(),
+            array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap()
+                .value(idx)
+                .as_ref(),
         ),
         DataType::Struct(_) => {
             let s = array.as_any().downcast_ref::<StructArray>().unwrap();
             let mut map = serde_json::Map::new();
             for (i, name) in s.column_names().iter().enumerate() {
-                map.insert(name.to_string(), arrow_value_to_typed_json(s.column(i).as_ref(), idx));
+                map.insert(
+                    name.to_string(),
+                    arrow_value_to_typed_json(s.column(i).as_ref(), idx),
+                );
             }
             serde_json::Value::Object(map)
         }
         DataType::Map(_, _) => {
-            let entries = array.as_any().downcast_ref::<MapArray>().unwrap().value(idx);
+            let entries = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap()
+                .value(idx);
             let pairs = (0..entries.len())
                 .map(|i| {
                     let mut pair = serde_json::Map::new();
-                    pair.insert("key".into(), arrow_value_to_typed_json(entries.column(0).as_ref(), i));
-                    pair.insert("value".into(), arrow_value_to_typed_json(entries.column(1).as_ref(), i));
+                    pair.insert(
+                        "key".into(),
+                        arrow_value_to_typed_json(entries.column(0).as_ref(), i),
+                    );
+                    pair.insert(
+                        "value".into(),
+                        arrow_value_to_typed_json(entries.column(1).as_ref(), i),
+                    );
                     serde_json::Value::Object(pair)
                 })
                 .collect();
@@ -504,10 +578,26 @@ pub fn arrow_value_to_typed_json(array: &dyn ArrowArray, idx: usize) -> serde_js
             };
             let any = array.as_any();
             let datetime = match unit {
-                TimeUnit::Second => timestamp_s_to_datetime(any.downcast_ref::<TimestampSecondArray>().unwrap().value(idx)),
-                TimeUnit::Millisecond => timestamp_ms_to_datetime(any.downcast_ref::<TimestampMillisecondArray>().unwrap().value(idx)),
-                TimeUnit::Microsecond => timestamp_us_to_datetime(any.downcast_ref::<TimestampMicrosecondArray>().unwrap().value(idx)),
-                TimeUnit::Nanosecond => timestamp_ns_to_datetime(any.downcast_ref::<TimestampNanosecondArray>().unwrap().value(idx)),
+                TimeUnit::Second => timestamp_s_to_datetime(
+                    any.downcast_ref::<TimestampSecondArray>()
+                        .unwrap()
+                        .value(idx),
+                ),
+                TimeUnit::Millisecond => timestamp_ms_to_datetime(
+                    any.downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap()
+                        .value(idx),
+                ),
+                TimeUnit::Microsecond => timestamp_us_to_datetime(
+                    any.downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .value(idx),
+                ),
+                TimeUnit::Nanosecond => timestamp_ns_to_datetime(
+                    any.downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap()
+                        .value(idx),
+                ),
             };
             match datetime {
                 // DuckDB stores TIMESTAMPTZ as a UTC instant; the zone only affects display.
@@ -547,12 +637,24 @@ fn base64_value(bytes: &[u8]) -> serde_json::Value {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     serde_json::Value::String(out)
 }
@@ -747,10 +849,7 @@ mod tests {
         let answer = arrow_value_to_json(batch.column(0).as_ref(), 0);
         let greeting = arrow_value_to_json(batch.column(1).as_ref(), 0);
         assert_eq!(answer, serde_json::Value::Number(42.into()));
-        assert_eq!(
-            greeting,
-            serde_json::Value::String("hello".to_string())
-        );
+        assert_eq!(greeting, serde_json::Value::String("hello".to_string()));
     }
 
     fn run(sql: &str, typed_values: bool) -> QueryOutput {
@@ -775,7 +874,12 @@ mod tests {
                 rows.push(map);
             }
         }
-        QueryOutput { columns, rows, followup: None, arrow: None }
+        QueryOutput {
+            columns,
+            rows,
+            followup: None,
+            arrow: None,
+        }
     }
 
     const TYPED_SQL: &str = "SELECT 1.25::DECIMAL(38,9) AS num, DATE '2024-01-02' AS d, \
@@ -821,7 +925,8 @@ mod tests {
         conn.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
         let mut insert = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
         let _: Vec<RecordBatch> = insert.query_arrow([]).unwrap().collect();
-        let columns = with_described_types(&conn, "INSERT INTO t VALUES (1)", result_columns(&insert));
+        let columns =
+            with_described_types(&conn, "INSERT INTO t VALUES (1)", result_columns(&insert));
         assert_eq!(columns[0].type_name, "BIGINT");
     }
 
@@ -860,9 +965,12 @@ mod tests {
     #[test]
     fn test_followup_sees_the_changes_of_the_first_statement() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(id, name);")
-            .unwrap();
-        let (columns, rows) = run_statement(&conn, "UPDATE t SET name = 'x' WHERE id = 2", true).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(id, name);",
+        )
+        .unwrap();
+        let (columns, rows) =
+            run_statement(&conn, "UPDATE t SET name = 'x' WHERE id = 2", true).unwrap();
         assert_eq!(columns[0].name, "Count");
         assert_eq!(rows[0]["Count"], serde_json::json!(1));
 
@@ -876,9 +984,12 @@ mod tests {
         use duckdb::arrow::datatypes::DataType as DT;
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("SET TimeZone = 'UTC';").unwrap();
-        let (columns, arrow) = run_statement_arrow(&conn,
+        let (columns, arrow) = run_statement_arrow(
+            &conn,
             "SELECT * FROM (VALUES (1::BIGINT, 'a', TIMESTAMPTZ '2024-01-02 03:04:05+00'), \
-             (2, 'b', NULL)) v(id, name, ts)").unwrap();
+             (2, 'b', NULL)) v(id, name, ts)",
+        )
+        .unwrap();
         assert_eq!(columns.len(), 3);
         assert_eq!(arrow.batches.iter().map(|b| b.row_count).sum::<usize>(), 2);
         // Every message is an encapsulated IPC message: continuation marker, then metadata length.
@@ -886,14 +997,20 @@ mod tests {
         assert_eq!(&schema[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
         let parsed = arrow_ipc::convert::try_schema_from_ipc_buffer(&schema).unwrap();
         assert_eq!(parsed.field(0).data_type(), &DT::Int64);
-        assert_eq!(parsed.field(2).data_type(),
-            &DT::Timestamp(duckdb::arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())));
+        assert_eq!(
+            parsed.field(2).data_type(),
+            &DT::Timestamp(
+                duckdb::arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into())
+            )
+        );
         let batch = decode_base64(&arrow.batches[0].data);
         assert_eq!(&batch[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
     fn decode_base64(text: &str) -> Vec<u8> {
-        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = Vec::new();
         let mut buffer = 0u32;
         let mut bits = 0;
