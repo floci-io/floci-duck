@@ -9,7 +9,8 @@ name: PR Limit
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review]
+    # closed and converted_to_draft only remove stale over-pr-limit labels.
+    types: [opened, reopened, ready_for_review, closed, converted_to_draft]
   # Manual hook: evaluate any open PR. Dry run by default, so it only logs the decision.
   workflow_dispatch:
     inputs:
@@ -27,9 +28,13 @@ permissions:
 
 concurrency:
   # github.ref is the base branch under pull_request_target, so key on the PR number;
-  # otherwise every PR run would cancel every other.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number }}
-  cancel-in-progress: true
+  # otherwise every PR run would cancel every other. Manual runs get their own group:
+  # GitHub keeps only one pending run per group, so sharing it would let a manual dry
+  # run replace a live evaluation waiting in the queue. Live runs for the same PR queue
+  # rather than cancel; a newer live event may replace an older pending one, which is
+  # fine because it evaluates the PR's current state.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || 'live' }}
+  cancel-in-progress: false
 
 jobs:
   pr-limit:
