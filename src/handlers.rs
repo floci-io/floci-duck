@@ -1,10 +1,10 @@
 use crate::executor::{execute_query, execute_query_returning};
 use crate::models::{ExecuteRequest, ExecuteResponse, QueryRequest, QueryResponse};
 use axum::{
-    http::{HeaderMap, StatusCode},
     Json,
+    http::{HeaderMap, StatusCode},
 };
-use tracing::{error, info, info_span, Instrument, Span};
+use tracing::{Instrument, Span, error, info, info_span};
 use uuid::Uuid;
 
 pub async fn handle_execute(

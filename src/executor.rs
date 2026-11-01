@@ -1,17 +1,1212 @@
 use crate::models::{ArrowIpc, ArrowIpcBatch, Column, ExecuteRequest, QueryRequest, QueryResult};
+use duckdb::Connection;
 use duckdb::arrow::array::{
     Array as ArrowArray, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
-    FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray, StringArray,
-    StructArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use duckdb::arrow::datatypes::DataType;
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::arrow::util::display::{ArrayFormatter, FormatOptions};
-use duckdb::core::LogicalTypeId;
-use duckdb::Connection;
+use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeId};
+use duckdb::types::DuckString;
+use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
+use duckdb::vtab::arrow::WritableVector;
 use std::env;
+use std::ffi::CStr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tracing::info;
+use zetasketch_rs::{Aggregator, HyperLogLogPlusPlus};
+
+struct FlociByteLength;
+
+impl VScalar for FlociByteLength {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let vector = input.flat_vector(0);
+        let values = unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            unsafe {
+                *output.as_mut_ptr::<i64>().add(index) =
+                    DuckString::new(&mut value).as_bytes().len() as i64;
+            }
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![LogicalTypeId::Varchar, LogicalTypeId::Blob]
+            .into_iter()
+            .map(|input| {
+                ScalarFunctionSignature::exact(vec![input.into()], LogicalTypeId::Bigint.into())
+            })
+            .collect()
+    }
+}
+
+struct FlociLength;
+
+impl VScalar for FlociLength {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use duckdb::ffi;
+
+        let input_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
+        let mut input_type = unsafe { ffi::duckdb_vector_get_column_type(input_vector) };
+        let input_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(input_type) });
+        let vector = input.flat_vector(0);
+        let values =
+            unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input.len()) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            let mut value = DuckString::new(&mut value);
+            let length = if input_type_id == LogicalTypeId::Blob {
+                value.as_bytes().len()
+            } else {
+                value.as_str().chars().count()
+            };
+            unsafe {
+                *output.as_mut_ptr::<i64>().add(index) = length as i64;
+            }
+        }
+        unsafe {
+            ffi::duckdb_destroy_logical_type(&mut input_type);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![LogicalTypeId::Varchar, LogicalTypeId::Blob]
+            .into_iter()
+            .map(|input| {
+                ScalarFunctionSignature::exact(vec![input.into()], LogicalTypeId::Bigint.into())
+            })
+            .collect()
+    }
+}
+
+struct BlobShiftLeft;
+
+impl VScalar for BlobShiftLeft {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let blobs = input.flat_vector(0);
+        let shifts = input.flat_vector(1);
+        let values = unsafe { blobs.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let shift_values = unsafe { shifts.as_slice_with_len::<i64>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if blobs.row_is_null(index as u64) || shifts.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let shift = shift_values[index];
+            if shift < 0 {
+                return Err("BYTES shift count must not be negative".into());
+            }
+            let mut value = *value;
+            let source = DuckString::new(&mut value).as_bytes();
+            let mut shifted = vec![0; source.len()];
+            let byte_shift = (shift / 8) as usize;
+            let bit_shift = (shift % 8) as u32;
+            for (target, byte) in shifted.iter_mut().enumerate() {
+                let source_index = target + byte_shift;
+                if source_index >= source.len() {
+                    break;
+                }
+                *byte = source[source_index] << bit_shift;
+                if bit_shift != 0 && source_index + 1 < source.len() {
+                    *byte |= source[source_index + 1] >> (8 - bit_shift);
+                }
+            }
+            output.insert(index, &shifted);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into(), LogicalTypeId::Bigint.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct BlobBitAnd;
+
+impl VScalar for BlobBitAnd {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let left = input.flat_vector(0);
+        let right = input.flat_vector(1);
+        let left_values = unsafe { left.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let right_values = unsafe { right.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for index in 0..len {
+            if left.row_is_null(index as u64) || right.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut left_value = left_values[index];
+            let mut right_value = right_values[index];
+            let left_bytes = DuckString::new(&mut left_value).as_bytes();
+            let right_bytes = DuckString::new(&mut right_value).as_bytes();
+            if left_bytes.len() != right_bytes.len() {
+                return Err("BYTES bitwise operands must have equal lengths".into());
+            }
+            let value: Vec<u8> = left_bytes
+                .iter()
+                .zip(right_bytes)
+                .map(|(left, right)| left & right)
+                .collect();
+            output.insert(index, &value);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into(), LogicalTypeId::Blob.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct BlobBitCount;
+
+impl VScalar for BlobBitCount {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let vector = input.flat_vector(0);
+        let values = unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            let count: i64 = DuckString::new(&mut value)
+                .as_bytes()
+                .iter()
+                .map(|byte| i64::from(byte.count_ones()))
+                .sum();
+            unsafe { *output.as_mut_ptr::<i64>().add(index) = count };
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into()],
+            LogicalTypeId::Bigint.into(),
+        )]
+    }
+}
+
+struct BlobRepeat;
+
+impl VScalar for BlobRepeat {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let values_vector = input.flat_vector(0);
+        let counts_vector = input.flat_vector(1);
+        let values =
+            unsafe { values_vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let counts = unsafe { counts_vector.as_slice_with_len::<i64>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if values_vector.row_is_null(index as u64) || counts_vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            if counts[index] < 0 {
+                return Err("BYTES repeat count must not be negative".into());
+            }
+            let mut value = *value;
+            output.insert(
+                index,
+                DuckString::new(&mut value)
+                    .as_bytes()
+                    .repeat(counts[index] as usize)
+                    .as_slice(),
+            );
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into(), LogicalTypeId::Bigint.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct BlobConcat;
+
+impl VScalar for BlobConcat {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let vectors: Vec<_> = (0..input.num_columns())
+            .map(|column| input.flat_vector(column))
+            .collect();
+        let values: Vec<_> = vectors
+            .iter()
+            .map(|vector| unsafe {
+                vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input.len())
+            })
+            .collect();
+        let mut output = output.flat_vector();
+        for index in 0..input.len() {
+            if vectors
+                .iter()
+                .any(|vector| vector.row_is_null(index as u64))
+            {
+                output.set_null(index);
+                continue;
+            }
+            let mut concatenated = Vec::new();
+            for column in &values {
+                let mut value = column[index];
+                concatenated.extend_from_slice(DuckString::new(&mut value).as_bytes());
+            }
+            output.insert(index, &concatenated);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        (2..=8)
+            .map(|arity| {
+                ScalarFunctionSignature::exact(
+                    (0..arity).map(|_| LogicalTypeId::Blob.into()).collect(),
+                    LogicalTypeId::Blob.into(),
+                )
+            })
+            .collect()
+    }
+}
+
+struct FlociHllInit;
+
+impl VScalar for FlociHllInit {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use duckdb::ffi;
+
+        let values_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
+        let mut values_type = unsafe { ffi::duckdb_vector_get_column_type(values_vector) };
+        let precision_vector = input.flat_vector(1);
+        let precisions = unsafe { precision_vector.as_slice_with_len::<i32>(input.len()) };
+        let mut output = output.flat_vector();
+
+        let result: Result<(), Box<dyn std::error::Error>> = (|| {
+            for (index, precision) in precisions.iter().enumerate().take(input.len()) {
+                if raw_vector_is_null(values_vector, index)
+                    || precision_vector.row_is_null(index as u64)
+                {
+                    output.set_null(index);
+                    continue;
+                }
+                match hll_init_list(values_vector, values_type, index, *precision)? {
+                    Some(sketch) => output.insert(index, &sketch),
+                    None => output.set_null(index),
+                }
+            }
+            Ok(())
+        })();
+        unsafe {
+            ffi::duckdb_destroy_logical_type(&mut values_type);
+        }
+        result
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Any.into(), LogicalTypeId::Integer.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct FlociHllExtract;
+
+impl VScalar for FlociHllExtract {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = input.flat_vector(0);
+        let values =
+            unsafe { input_vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input.len()) };
+        let output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if input_vector.row_is_null(index as u64) {
+                unsafe { *output.as_mut_ptr::<i64>().add(index) = 0 };
+                continue;
+            }
+            let mut value = *value;
+            let sketch = parse_hll(DuckString::new(&mut value).as_bytes())?;
+            unsafe { *output.as_mut_ptr::<i64>().add(index) = sketch.result()? };
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into()],
+            LogicalTypeId::Bigint.into(),
+        )]
+    }
+}
+
+struct FlociHllMerge;
+
+impl VScalar for FlociHllMerge {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        invoke_hll_merge(input, output, false)
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Any.into()],
+            LogicalTypeId::Bigint.into(),
+        )]
+    }
+}
+
+struct FlociHllMergePartial;
+
+impl VScalar for FlociHllMergePartial {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        invoke_hll_merge(input, output, true)
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Any.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+fn hll_init_list(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+    precision: i32,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    if LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(logical_type) }) != LogicalTypeId::List
+    {
+        return Err("floci_hll_init requires a LIST argument".into());
+    }
+    let entry = unsafe { raw_vector_value::<ffi::duckdb_list_entry>(vector, index) };
+    // HLL_COUNT.INIT is NULL for an aggregate group with no non-NULL inputs.
+    // The translator removes NULLs before calling this scalar shim, so an empty
+    // list represents both the all-NULL and empty-input aggregate cases.
+    if entry.length == 0 {
+        return Ok(None);
+    }
+    let child_vector = unsafe { ffi::duckdb_list_vector_get_child(vector) };
+    let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
+    let child_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(child_type) });
+
+    let result =
+        (|| {
+            let builder = HyperLogLogPlusPlus::builder().normal_precision(precision);
+            let mut sketch = match child_type_id {
+                LogicalTypeId::Varchar => builder.build_for_string()?,
+                LogicalTypeId::Blob => builder.build_for_bytes()?,
+                LogicalTypeId::Tinyint
+                | LogicalTypeId::Smallint
+                | LogicalTypeId::Integer
+                | LogicalTypeId::Bigint => builder.build_for_u64()?,
+                other => return Err(format!("HLL_COUNT.INIT does not support {other:?}").into()),
+            };
+
+            for child_index in entry.offset..entry.offset + entry.length {
+                let child_index = child_index as usize;
+                if raw_vector_is_null(child_vector, child_index) {
+                    continue;
+                }
+                match child_type_id {
+                    LogicalTypeId::Varchar => {
+                        let mut value = unsafe {
+                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
+                        };
+                        sketch.add_string(DuckString::new(&mut value).as_str().as_ref())?;
+                    }
+                    LogicalTypeId::Blob => {
+                        let mut value = unsafe {
+                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
+                        };
+                        sketch.add_bytes(DuckString::new(&mut value).as_bytes())?;
+                    }
+                    LogicalTypeId::Tinyint => {
+                        sketch.add_i64(
+                            unsafe { raw_vector_value::<i8>(child_vector, child_index) } as i64,
+                        )?
+                    }
+                    LogicalTypeId::Smallint => sketch.add_i64(unsafe {
+                        raw_vector_value::<i16>(child_vector, child_index)
+                    } as i64)?,
+                    LogicalTypeId::Integer => sketch.add_i64(unsafe {
+                        raw_vector_value::<i32>(child_vector, child_index)
+                    } as i64)?,
+                    LogicalTypeId::Bigint => sketch
+                        .add_i64(unsafe { raw_vector_value::<i64>(child_vector, child_index) })?,
+                    _ => unreachable!(),
+                }
+            }
+            Ok(Some(sketch.serialize_to_bytes()?))
+        })();
+    unsafe {
+        ffi::duckdb_destroy_logical_type(&mut child_type);
+    }
+    result
+}
+
+fn parse_hll(bytes: &[u8]) -> Result<HyperLogLogPlusPlus, Box<dyn std::error::Error>> {
+    Ok(HyperLogLogPlusPlus::from_bytes(bytes)?)
+}
+
+fn merged_hll_list(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+) -> Result<Option<HyperLogLogPlusPlus>, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    if LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(logical_type) }) != LogicalTypeId::List
+    {
+        return Err("HLL_COUNT.MERGE requires a LIST argument".into());
+    }
+    let entry = unsafe { raw_vector_value::<ffi::duckdb_list_entry>(vector, index) };
+    let child_vector = unsafe { ffi::duckdb_list_vector_get_child(vector) };
+    let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
+    let child_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(child_type) });
+    if child_type_id != LogicalTypeId::Blob {
+        unsafe { ffi::duckdb_destroy_logical_type(&mut child_type) };
+        return Err(format!("HLL_COUNT.MERGE requires BYTES, found {child_type_id:?}").into());
+    }
+
+    let result = (|| {
+        let mut merged: Option<HyperLogLogPlusPlus> = None;
+        for child_index in entry.offset..entry.offset + entry.length {
+            let child_index = child_index as usize;
+            if raw_vector_is_null(child_vector, child_index) {
+                continue;
+            }
+            let mut value =
+                unsafe { raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index) };
+            let sketch = parse_hll(DuckString::new(&mut value).as_bytes())?;
+            if let Some(current) = &mut merged {
+                current.merge_aggregator(sketch)?;
+            } else {
+                merged = Some(sketch);
+            }
+        }
+        Ok(merged)
+    })();
+    unsafe {
+        ffi::duckdb_destroy_logical_type(&mut child_type);
+    }
+    result
+}
+
+fn invoke_hll_merge(
+    input: &mut DataChunkHandle,
+    output: &mut dyn WritableVector,
+    partial: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    let input_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
+    let mut input_type = unsafe { ffi::duckdb_vector_get_column_type(input_vector) };
+    let mut output = output.flat_vector();
+    let result = (|| {
+        for index in 0..input.len() {
+            if raw_vector_is_null(input_vector, index) {
+                if partial {
+                    output.set_null(index);
+                } else {
+                    unsafe { *output.as_mut_ptr::<i64>().add(index) = 0 };
+                }
+                continue;
+            }
+            let merged = merged_hll_list(input_vector, input_type, index)?;
+            if partial {
+                match merged {
+                    Some(sketch) => output.insert(index, &sketch.serialize_to_bytes()?),
+                    None => output.set_null(index),
+                }
+            } else {
+                let estimate = match merged {
+                    Some(sketch) => sketch.result()?,
+                    None => 0,
+                };
+                unsafe { *output.as_mut_ptr::<i64>().add(index) = estimate };
+            }
+        }
+        Ok(())
+    })();
+    unsafe {
+        ffi::duckdb_destroy_logical_type(&mut input_type);
+    }
+    result
+}
+
+struct IpToString;
+
+impl VScalar for IpToString {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let vector = input.flat_vector(0);
+        let values = unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            let bytes = DuckString::new(&mut value).as_bytes();
+            let address = match bytes.len() {
+                4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(bytes)?)),
+                16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes)?)),
+                _ => return Err("NET.IP_TO_STRING requires a 4-byte or 16-byte address".into()),
+            };
+            output.insert(index, address.to_string().as_str());
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into()],
+            LogicalTypeId::Varchar.into(),
+        )]
+    }
+}
+
+struct IpFromString;
+
+impl VScalar for IpFromString {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_len = input.len();
+        let input_vector = input.flat_vector(0);
+        let input_values =
+            unsafe { input_vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input_len) };
+        let mut output_vector = output.flat_vector();
+
+        for (index, input_value) in input_values.iter().enumerate() {
+            if input_vector.row_is_null(index as u64) {
+                output_vector.set_null(index);
+                continue;
+            }
+
+            let mut input_value = *input_value;
+            let address = DuckString::new(&mut input_value)
+                .as_str()
+                .parse::<IpAddr>()?;
+            match address {
+                IpAddr::V4(address) => output_vector.insert(index, address.octets().as_slice()),
+                IpAddr::V6(address) => output_vector.insert(index, address.octets().as_slice()),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct SafeIpFromString;
+
+impl VScalar for SafeIpFromString {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let vector = input.flat_vector(0);
+        let values = unsafe { vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let mut output = output.flat_vector();
+        for (index, value) in values.iter().enumerate() {
+            if vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut value = *value;
+            match DuckString::new(&mut value).as_str().parse::<IpAddr>() {
+                Ok(IpAddr::V4(address)) => output.insert(index, address.octets().as_slice()),
+                Ok(IpAddr::V6(address)) => output.insert(index, address.octets().as_slice()),
+                Err(_) => output.set_null(index),
+            }
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Varchar.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct IpTrunc;
+
+impl VScalar for IpTrunc {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let address_vector = input.flat_vector(0);
+        let prefix_vector = input.flat_vector(1);
+        let addresses =
+            unsafe { address_vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(len) };
+        let prefixes = unsafe { prefix_vector.as_slice_with_len::<i64>(len) };
+        let mut output = output.flat_vector();
+        for (index, address) in addresses.iter().enumerate() {
+            if address_vector.row_is_null(index as u64) || prefix_vector.row_is_null(index as u64) {
+                output.set_null(index);
+                continue;
+            }
+            let mut address = *address;
+            let mut bytes = DuckString::new(&mut address).as_bytes().to_vec();
+            let prefix = prefixes[index];
+            let maximum_bits = match bytes.len() {
+                4 => 32,
+                16 => 128,
+                _ => return Err("NET.IP_TRUNC requires a 4-byte or 16-byte address".into()),
+            };
+            if prefix < 0 || prefix > maximum_bits {
+                return Err(format!(
+                    "NET.IP_TRUNC prefix length {prefix} is invalid for a {}-byte address",
+                    bytes.len()
+                )
+                .into());
+            }
+            let full_bytes = (prefix / 8) as usize;
+            let remaining_bits = (prefix % 8) as u8;
+            if remaining_bits != 0 && full_bytes < bytes.len() {
+                bytes[full_bytes] &= u8::MAX << (8 - remaining_bits);
+            }
+            for byte in bytes
+                .iter_mut()
+                .skip(full_bytes + usize::from(remaining_bits != 0))
+            {
+                *byte = 0;
+            }
+            output.insert(index, &bytes);
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeId::Blob.into(), LogicalTypeId::Bigint.into()],
+            LogicalTypeId::Blob.into(),
+        )]
+    }
+}
+
+struct FarmFingerprint;
+
+impl VScalar for FarmFingerprint {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_len = input.len();
+        let input_vector = input.flat_vector(0);
+        let input_values =
+            unsafe { input_vector.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(input_len) };
+        let mut output_vector = output.flat_vector();
+
+        for (index, input_value) in input_values.iter().enumerate() {
+            if input_vector.row_is_null(index as u64) {
+                output_vector.set_null(index);
+                continue;
+            }
+
+            let mut input_value = *input_value;
+            let value = DuckString::new(&mut input_value).as_bytes();
+            unsafe {
+                *output_vector.as_mut_ptr::<i64>().add(index) =
+                    farmhash::fingerprint64(value) as i64;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Varchar.into()],
+                LogicalTypeId::Bigint.into(),
+            ),
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Blob.into()],
+                LogicalTypeId::Bigint.into(),
+            ),
+        ]
+    }
+}
+
+struct FlociToJsonString;
+
+impl VScalar for FlociToJsonString {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let input_vector = unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
+        let pretty_vector = (input.num_columns() == 2)
+            .then(|| unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 1) });
+        let mut input_type = unsafe { duckdb::ffi::duckdb_vector_get_column_type(input_vector) };
+        let mut output = output.flat_vector();
+
+        let result: Result<(), Box<dyn std::error::Error>> = (|| {
+            for index in 0..input.len() {
+                if pretty_vector.is_some_and(|vector| raw_vector_is_null(vector, index)) {
+                    output.set_null(index);
+                    continue;
+                }
+
+                if raw_vector_is_null(input_vector, index) {
+                    output.set_null(index);
+                    continue;
+                }
+                let value = raw_vector_to_json(input_vector, input_type, index)?;
+                let pretty = pretty_vector
+                    .map(|vector| unsafe { raw_vector_value::<bool>(vector, index) })
+                    .unwrap_or(false);
+                let json = if pretty {
+                    serde_json::to_string_pretty(&value)?
+                } else {
+                    serde_json::to_string(&value)?
+                };
+                output.insert(index, &json);
+            }
+            Ok(())
+        })();
+        unsafe {
+            duckdb::ffi::duckdb_destroy_logical_type(&mut input_type);
+        }
+
+        result
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Any.into()],
+                LogicalTypeId::Varchar.into(),
+            ),
+            ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Any.into(), LogicalTypeId::Boolean.into()],
+                LogicalTypeId::Varchar.into(),
+            ),
+        ]
+    }
+}
+
+fn raw_vector_is_null(vector: duckdb::ffi::duckdb_vector, index: usize) -> bool {
+    unsafe {
+        let validity = duckdb::ffi::duckdb_vector_get_validity(vector);
+        !validity.is_null() && !duckdb::ffi::duckdb_validity_row_is_valid(validity, index as u64)
+    }
+}
+
+unsafe fn raw_vector_value<T: Copy>(vector: duckdb::ffi::duckdb_vector, index: usize) -> T {
+    unsafe { *(duckdb::ffi::duckdb_vector_get_data(vector) as *const T).add(index) }
+}
+
+fn raw_vector_to_json(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    if raw_vector_is_null(vector, index) {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(logical_type) });
+    match type_id {
+        LogicalTypeId::Boolean => Ok(serde_json::Value::Bool(unsafe {
+            raw_vector_value::<bool>(vector, index)
+        })),
+        LogicalTypeId::Tinyint => Ok(unsafe { raw_vector_value::<i8>(vector, index) }.into()),
+        LogicalTypeId::Smallint => Ok(unsafe { raw_vector_value::<i16>(vector, index) }.into()),
+        LogicalTypeId::Integer => Ok(unsafe { raw_vector_value::<i32>(vector, index) }.into()),
+        LogicalTypeId::Bigint => {
+            let value = unsafe { raw_vector_value::<i64>(vector, index) };
+            Ok(json_int64(value))
+        }
+        LogicalTypeId::UTinyint => Ok(unsafe { raw_vector_value::<u8>(vector, index) }.into()),
+        LogicalTypeId::USmallint => Ok(unsafe { raw_vector_value::<u16>(vector, index) }.into()),
+        LogicalTypeId::UInteger => Ok(unsafe { raw_vector_value::<u32>(vector, index) }.into()),
+        LogicalTypeId::UBigint => {
+            let value = unsafe { raw_vector_value::<u64>(vector, index) };
+            Ok(if value <= 9_007_199_254_740_992 {
+                value.into()
+            } else {
+                serde_json::Value::String(value.to_string())
+            })
+        }
+        LogicalTypeId::Date => {
+            let date = unsafe { raw_vector_value::<ffi::duckdb_date>(vector, index) };
+            let parts = unsafe { ffi::duckdb_from_date(date) };
+            Ok(serde_json::Value::String(format!(
+                "{:04}-{:02}-{:02}",
+                parts.year, parts.month, parts.day
+            )))
+        }
+        LogicalTypeId::Time => {
+            let time = unsafe { raw_vector_value::<ffi::duckdb_time>(vector, index) };
+            let parts = unsafe { ffi::duckdb_from_time(time) };
+            Ok(serde_json::Value::String(format_time(parts)))
+        }
+        LogicalTypeId::TimeTZ => {
+            let time = unsafe { raw_vector_value::<ffi::duckdb_time_tz>(vector, index) };
+            let parts = unsafe { ffi::duckdb_from_time_tz(time) };
+            Ok(serde_json::Value::String(format_time(parts.time)))
+        }
+        LogicalTypeId::Hugeint => {
+            let value = unsafe { raw_vector_value::<ffi::duckdb_hugeint>(vector, index) };
+            let value = ((value.upper as i128) << 64) + value.lower as i128;
+            Ok(serde_json::Value::String(value.to_string()))
+        }
+        LogicalTypeId::UHugeint => {
+            let value = unsafe { raw_vector_value::<ffi::duckdb_uhugeint>(vector, index) };
+            let value = ((value.upper as u128) << 64) | value.lower as u128;
+            Ok(serde_json::Value::String(value.to_string()))
+        }
+        LogicalTypeId::Uuid => {
+            let value = unsafe { raw_vector_value::<ffi::duckdb_uhugeint>(vector, index) };
+            let value = ((value.upper as u128) << 64) | value.lower as u128;
+            Ok(serde_json::Value::String(
+                uuid::Uuid::from_u128(value).to_string(),
+            ))
+        }
+        LogicalTypeId::Float => {
+            float_to_json(unsafe { raw_vector_value::<f32>(vector, index) } as f64)
+        }
+        LogicalTypeId::Double => float_to_json(unsafe { raw_vector_value::<f64>(vector, index) }),
+        LogicalTypeId::Decimal => raw_decimal_to_json(vector, logical_type, index),
+        LogicalTypeId::Varchar => {
+            let mut value = unsafe { raw_vector_value::<ffi::duckdb_string_t>(vector, index) };
+            let value = DuckString::new(&mut value).as_str().into_owned();
+            if logical_type_has_alias(logical_type, "JSON") {
+                Ok(serde_json::from_str(&value)?)
+            } else {
+                Ok(serde_json::Value::String(value))
+            }
+        }
+        LogicalTypeId::Blob => {
+            let mut value = unsafe { raw_vector_value::<ffi::duckdb_string_t>(vector, index) };
+            Ok(base64_value(DuckString::new(&mut value).as_bytes()))
+        }
+        LogicalTypeId::Timestamp => {
+            let timestamp = unsafe { raw_vector_value::<ffi::duckdb_timestamp>(vector, index) };
+            Ok(serde_json::Value::String(format_datetime(
+                timestamp.micros,
+            )?))
+        }
+        LogicalTypeId::TimestampTZ => {
+            let timestamp = unsafe { raw_vector_value::<ffi::duckdb_timestamp>(vector, index) };
+            Ok(serde_json::Value::String(format!(
+                "{}Z",
+                format_datetime(timestamp.micros)?
+            )))
+        }
+        LogicalTypeId::Struct => raw_struct_to_json(vector, logical_type, index),
+        LogicalTypeId::List => raw_list_to_json(vector, logical_type, index),
+        other => Err(format!("floci_to_json_string does not support {other:?} values").into()),
+    }
+}
+
+fn logical_type_has_alias(logical_type: duckdb::ffi::duckdb_logical_type, expected: &str) -> bool {
+    use duckdb::ffi;
+
+    let alias = unsafe { ffi::duckdb_logical_type_get_alias(logical_type) };
+    if alias.is_null() {
+        return false;
+    }
+    let matches = unsafe { CStr::from_ptr(alias) }
+        .to_str()
+        .is_ok_and(|alias| alias.eq_ignore_ascii_case(expected));
+    unsafe { ffi::duckdb_free(alias.cast()) };
+    matches
+}
+
+fn raw_decimal_to_json(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    let scale = unsafe { ffi::duckdb_decimal_scale(logical_type) } as usize;
+    let internal_type = unsafe { ffi::duckdb_decimal_internal_type(logical_type) };
+    let raw = match internal_type {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT => unsafe {
+            raw_vector_value::<i8>(vector, index) as i128
+        },
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => unsafe {
+            raw_vector_value::<i16>(vector, index) as i128
+        },
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => unsafe {
+            raw_vector_value::<i32>(vector, index) as i128
+        },
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => unsafe {
+            raw_vector_value::<i64>(vector, index) as i128
+        },
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => {
+            let value = unsafe { raw_vector_value::<ffi::duckdb_hugeint>(vector, index) };
+            ((value.upper as i128) << 64) | (value.lower as u128 as i128)
+        }
+        other => return Err(format!("unsupported DECIMAL internal type {other}").into()),
+    };
+
+    let negative = raw < 0;
+    let digits = raw.unsigned_abs().to_string();
+    let number = if scale == 0 {
+        digits
+    } else if digits.len() <= scale {
+        format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+    } else {
+        let split = digits.len() - scale;
+        format!("{}.{}", &digits[..split], &digits[split..])
+    };
+    let json_number = if negative {
+        format!("-{number}")
+    } else {
+        number
+    };
+    Ok(serde_json::from_str(&json_number)?)
+}
+
+fn float_to_json(value: f64) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    if value.is_nan() {
+        return Ok(serde_json::Value::String("NaN".into()));
+    }
+    if value == f64::INFINITY {
+        return Ok(serde_json::Value::String("Infinity".into()));
+    }
+    if value == f64::NEG_INFINITY {
+        return Ok(serde_json::Value::String("-Infinity".into()));
+    }
+    serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .ok_or_else(|| "floci_to_json_string cannot encode this floating-point value".into())
+}
+
+fn json_int64(value: i64) -> serde_json::Value {
+    if (-9_007_199_254_740_992..=9_007_199_254_740_992).contains(&value) {
+        value.into()
+    } else {
+        serde_json::Value::String(value.to_string())
+    }
+}
+
+fn format_time(time: duckdb::ffi::duckdb_time_struct) -> String {
+    let fraction = format_fractional_micros(time.micros as u32);
+    format!("{:02}:{:02}:{:02}{fraction}", time.hour, time.min, time.sec)
+}
+
+fn format_fractional_micros(micros: u32) -> String {
+    if micros == 0 {
+        String::new()
+    } else if micros.is_multiple_of(1_000) {
+        // BigQuery's canonical temporal JSON representation uses millisecond
+        // precision when the remaining three microsecond digits are all zero.
+        format!(".{:03}", micros / 1_000)
+    } else {
+        format!(".{micros:06}")
+    }
+}
+
+fn format_datetime(micros_since_epoch: i64) -> Result<String, Box<dyn std::error::Error>> {
+    let datetime =
+        duckdb::arrow::temporal_conversions::timestamp_us_to_datetime(micros_since_epoch)
+            .ok_or("TIMESTAMP value is out of range")?;
+    let base = datetime.format("%Y-%m-%dT%H:%M:%S").to_string();
+    Ok(format!(
+        "{base}{}",
+        format_fractional_micros(datetime.and_utc().timestamp_subsec_micros())
+    ))
+}
+
+fn raw_struct_to_json(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    let child_count = unsafe { ffi::duckdb_struct_type_child_count(logical_type) as usize };
+    let mut value = serde_json::Map::with_capacity(child_count);
+    for child_index in 0..child_count {
+        let name_ptr =
+            unsafe { ffi::duckdb_struct_type_child_name(logical_type, child_index as u64) };
+        let name = unsafe { CStr::from_ptr(name_ptr) }.to_str()?.to_owned();
+        unsafe {
+            ffi::duckdb_free(name_ptr.cast());
+        }
+
+        let mut child_type =
+            unsafe { ffi::duckdb_struct_type_child_type(logical_type, child_index as u64) };
+        let child_vector =
+            unsafe { ffi::duckdb_struct_vector_get_child(vector, child_index as u64) };
+        let child_value = raw_vector_to_json(child_vector, child_type, index);
+        unsafe {
+            ffi::duckdb_destroy_logical_type(&mut child_type);
+        }
+        value.insert(name, child_value?);
+    }
+
+    Ok(serde_json::Value::Object(value))
+}
+
+fn raw_list_to_json(
+    vector: duckdb::ffi::duckdb_vector,
+    logical_type: duckdb::ffi::duckdb_logical_type,
+    index: usize,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use duckdb::ffi;
+
+    let entry = unsafe { raw_vector_value::<ffi::duckdb_list_entry>(vector, index) };
+    let child_vector = unsafe { ffi::duckdb_list_vector_get_child(vector) };
+    let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
+    let mut values = Vec::with_capacity(entry.length as usize);
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        for child_index in entry.offset..entry.offset + entry.length {
+            values.push(raw_vector_to_json(
+                child_vector,
+                child_type,
+                child_index as usize,
+            )?);
+        }
+        Ok(())
+    })();
+    unsafe {
+        ffi::duckdb_destroy_logical_type(&mut child_type);
+    }
+    result?;
+
+    Ok(serde_json::Value::Array(values))
+}
 
 fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
@@ -27,6 +1222,34 @@ fn apply_variables(sql: &str, variables: &std::collections::HashMap<String, Stri
 
 fn open_conn() -> anyhow::Result<Connection> {
     let conn = Connection::open_in_memory()?;
+    // BigQuery's JSON_EXTRACT_ARRAY returns an unnestable array of JSON values.
+    // DuckDB's equivalent returns one JSON value, so cast it to JSON[] for
+    // compatibility with queries that immediately UNNEST the result.
+    conn.execute_batch(
+        "CREATE MACRO json_extract_array(input_json, json_path := '$') AS (
+            cast_to_type(
+              list_transform(json_extract(input_json, json_path)::JSON[], value -> CAST(value AS VARCHAR)),
+              [input_json][1:0]
+            )
+        );",
+    )?;
+    conn.register_scalar_function::<IpToString>("ip_to_string")?;
+    conn.register_scalar_function::<IpFromString>("ip_from_string")?;
+    conn.register_scalar_function::<SafeIpFromString>("safe_ip_from_string")?;
+    conn.register_scalar_function::<IpTrunc>("ip_trunc")?;
+    conn.register_scalar_function::<FarmFingerprint>("farm_fingerprint")?;
+    conn.register_scalar_function::<FlociToJsonString>("floci_to_json_string")?;
+    conn.register_scalar_function::<FlociByteLength>("floci_byte_length")?;
+    conn.register_scalar_function::<FlociLength>("floci_length")?;
+    conn.register_scalar_function::<BlobShiftLeft>("<<")?;
+    conn.register_scalar_function::<BlobBitAnd>("&")?;
+    conn.register_scalar_function::<BlobBitCount>("bit_count")?;
+    conn.register_scalar_function::<BlobRepeat>("repeat")?;
+    conn.register_scalar_function::<BlobConcat>("concat")?;
+    conn.register_scalar_function::<FlociHllInit>("floci_hll_init")?;
+    conn.register_scalar_function::<FlociHllExtract>("floci_hll_extract")?;
+    conn.register_scalar_function::<FlociHllMerge>("floci_hll_merge")?;
+    conn.register_scalar_function::<FlociHllMergePartial>("floci_hll_merge_partial")?;
     if let Ok(ext_dir) = env::var("FLOCI_DUCK_EXT_DIR") {
         info!("Setting extension directory to: {}", ext_dir);
         conn.execute_batch(&format!(
@@ -37,13 +1260,13 @@ fn open_conn() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
-/// Called once at startup to ensure httpfs is installed on disk.
-/// Subsequent per-request `LOAD httpfs` calls will find it locally and skip the network download.
+/// Called once at startup to ensure extensions used by queries are installed on disk.
+/// Installing them serially avoids concurrent requests racing to auto-install the same extension.
 pub fn preflight() -> anyhow::Result<()> {
-    info!("Preflight: installing httpfs extension...");
+    info!("Preflight: installing DuckDB extensions...");
     let conn = open_conn()?;
-    conn.execute_batch("INSTALL httpfs;")?;
-    info!("Preflight: httpfs installed successfully");
+    conn.execute_batch("INSTALL httpfs; INSTALL icu;")?;
+    info!("Preflight: DuckDB extensions installed successfully");
     Ok(())
 }
 
@@ -247,7 +1470,7 @@ pub fn execute_query_returning(req: QueryRequest) -> anyhow::Result<QueryOutput>
 /// Runs one statement and returns its result as Arrow IPC messages instead of JSON rows.
 fn run_statement_arrow(conn: &Connection, sql: &str) -> anyhow::Result<(Vec<Column>, ArrowIpc)> {
     use arrow_ipc::writer::{
-        write_message, CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+        CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
     };
 
     let mut stmt = conn.prepare(sql)?;
@@ -833,6 +2056,332 @@ mod tests {
     }
 
     #[test]
+    fn test_farm_fingerprint_matches_bigquery_for_string_and_bytes() {
+        let conn = open_conn().unwrap();
+        let (first, second, third, bytes, null_string, null_bytes): (
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT
+                    farm_fingerprint('1footrue'),
+                    farm_fingerprint('2applefalse'),
+                    farm_fingerprint('3true'),
+                    farm_fingerprint(CAST('1footrue' AS BLOB)),
+                    farm_fingerprint(NULL::VARCHAR),
+                    farm_fingerprint(NULL::BLOB)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        // Values from BigQuery's FARM_FINGERPRINT documentation. The first and third
+        // vectors also ensure hashes with the high bit set are returned as signed INT64.
+        assert_eq!(first, -1_541_654_101_129_638_711);
+        assert_eq!(second, 2_794_438_866_806_483_259);
+        assert_eq!(third, -4_880_158_226_897_771_312);
+        assert_eq!(bytes, first);
+        assert_eq!(null_string, None);
+        assert_eq!(null_bytes, None);
+    }
+
+    #[test]
+    fn test_hll_functions_use_bigquery_compatible_zetasketch_bytes() {
+        let conn = open_conn().unwrap();
+        let (serialized, extracted, merged_raw): (String, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    to_base64(floci_hll_init(['ip1'], 15)),
+                    floci_hll_extract(from_base64('CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==')),
+                    floci_hll_merge([
+                        from_base64('CHAQARgCIAiCBwsQARgPIBQyA5ajLg=='),
+                        from_base64('CHAQAhgCIAiCBw8QAhgPIBQyB6z8INWlrwE=')
+                    ])",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(serialized, "CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==");
+        assert_eq!(extracted, 1);
+        assert_eq!(merged_raw, 3);
+        assert!(parse_hll(b"CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==").is_err());
+    }
+
+    #[test]
+    fn test_length_functions_distinguish_characters_from_bytes() {
+        let conn = open_conn().unwrap();
+        let lengths: (i64, i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                   floci_length('hé'),
+                   floci_length(from_hex('00FF')),
+                   floci_byte_length('hé'),
+                   floci_byte_length(from_hex('00FF')),
+                   floci_length('é'),
+                   floci_byte_length('é'),
+                   floci_length('👨‍👩‍👧‍👦'),
+                   floci_byte_length('👨‍👩‍👧‍👦')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(lengths, (2, 2, 3, 2, 2, 3, 7, 25));
+    }
+
+    #[test]
+    fn test_hll_functions_compose_through_an_aggregate_cte() {
+        let conn = open_conn().unwrap();
+        let (extracted, merged): (i64, i64) = conn
+            .query_row(
+                "WITH users(name) AS (VALUES ('ana'), ('bo'), ('cyd')),
+                 sketches AS (
+                   SELECT floci_hll_init(
+                     list_filter(list(DISTINCT name), value -> value IS NOT NULL), 20
+                   ) AS sketch
+                   FROM users
+                 )
+                 SELECT floci_hll_extract(sketch),
+                   (SELECT floci_hll_merge(list(value))
+                    FROM UNNEST([sketch, sketch]) AS values(value))
+                 FROM sketches",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(extracted, 3);
+        assert_eq!(merged, 3);
+    }
+
+    #[test]
+    fn test_hll_init_returns_null_without_non_null_inputs() {
+        let conn = open_conn().unwrap();
+        let (all_null, no_rows): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT
+                   floci_hll_init(list_filter(list(value), value -> value IS NOT NULL), 15),
+                   (SELECT floci_hll_init(list_filter(list(value), value -> value IS NOT NULL), 15)
+                    FROM (SELECT 'never' AS value WHERE FALSE))
+                 FROM (VALUES (CAST(NULL AS VARCHAR))) AS inputs(value)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(all_null, None);
+        assert_eq!(no_rows, None);
+    }
+
+    #[test]
+    fn test_blob_bitwise_operators_preserve_width_and_use_big_endian_bits() {
+        let conn = open_conn().unwrap();
+        let (shifted, masked, bit_is_set): (Vec<u8>, Vec<u8>, bool) = conn
+            .query_row(
+                "SELECT FROM_HEX('0102') << 4,
+                        FROM_HEX('12f0') & FROM_HEX('0ff0'),
+                        BIT_COUNT(FROM_HEX('10') &
+                          (concat(repeat(FROM_HEX('00'), 0), FROM_HEX('01')) << 4)) != 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(shifted, vec![0x10, 0x20]);
+        assert_eq!(masked, vec![0x02, 0xf0]);
+        assert!(bit_is_set);
+    }
+
+    #[test]
+    fn test_floci_to_json_string_uses_canonical_fractional_second_widths() {
+        let conn = open_conn().unwrap();
+        let (millis, datetime, timestamp): (String, String, String) = conn
+            .query_row(
+                "SELECT
+                   floci_to_json_string(TIMESTAMP '2021-07-11 06:07:08.120000'),
+                   floci_to_json_string(TIMESTAMP '2021-07-11 06:07:08.123400'),
+                   floci_to_json_string(TIMESTAMPTZ '2021-07-11 06:07:08.123400+00')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(millis, r#""2021-07-11T06:07:08.120""#);
+        assert_eq!(datetime, r#""2021-07-11T06:07:08.123400""#);
+        assert_eq!(timestamp, r#""2021-07-11T06:07:08.123400Z""#);
+    }
+
+    #[test]
+    fn test_floci_to_json_string_honors_pretty_print_and_propagates_nulls() {
+        let conn = open_conn().unwrap();
+        let (null_value, pretty, null_pretty): (Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT
+                   floci_to_json_string(CAST(NULL AS VARCHAR)),
+                   floci_to_json_string({'id': 1, 'coordinates': [10, 20]}, TRUE),
+                   floci_to_json_string({'id': 1}, CAST(NULL AS BOOLEAN))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(null_value, None);
+        assert_eq!(
+            pretty,
+            "{\n  \"id\": 1,\n  \"coordinates\": [\n    10,\n    20\n  ]\n}"
+        );
+        assert_eq!(null_pretty, None);
+    }
+
+    #[test]
+    fn test_floci_to_json_string_preserves_timestamp_types_recursively() {
+        let conn = open_conn().unwrap();
+        let (timestamp, timestamptz, nested, ordinary_string, null, decimal, negative_decimal): (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT
+                    floci_to_json_string(TIMESTAMP '2024-01-02 03:04:05.123456'),
+                    floci_to_json_string(TIMESTAMPTZ '2024-01-02 03:04:05.123456+00'),
+                    floci_to_json_string({
+                        'at': TIMESTAMPTZ '2024-01-02 03:04:05.123456+00',
+                        'local_at': TIMESTAMP '2024-01-03 04:05:06',
+                        'events': [
+                            TIMESTAMPTZ '2024-01-03 04:05:06+00',
+                            NULL::TIMESTAMPTZ
+                        ]
+                    }),
+                    floci_to_json_string('2024-01-02 03:04:05+00'),
+                    floci_to_json_string(NULL::TIMESTAMPTZ),
+                    floci_to_json_string(CAST('123.4500' AS DECIMAL(10, 4))),
+                    floci_to_json_string(CAST('-0.0012' AS DECIMAL(10, 4)))",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(timestamp, "\"2024-01-02T03:04:05.123456\"");
+        assert_eq!(timestamptz, "\"2024-01-02T03:04:05.123456Z\"");
+        assert_eq!(
+            nested,
+            r#"{"at":"2024-01-02T03:04:05.123456Z","local_at":"2024-01-03T04:05:06","events":["2024-01-03T04:05:06Z",null]}"#
+        );
+        assert_eq!(ordinary_string, "\"2024-01-02 03:04:05+00\"");
+        assert_eq!(null, None);
+        assert_eq!(decimal, "123.45");
+        assert_eq!(negative_decimal, "-0.0012");
+    }
+
+    #[test]
+    fn test_floci_to_json_string_preserves_nested_json_values() {
+        let conn = open_conn().unwrap();
+        let encoded: String = conn
+            .query_row(
+                "SELECT floci_to_json_string([
+                    JSON '1',
+                    JSON '20',
+                    JSON '[20, \"This is a string\", {\"a\": 1}]'
+                ])",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(encoded, r#"[1,20,[20,"This is a string",{"a":1}]]"#);
+    }
+
+    #[test]
+    fn test_json_extract_array_supports_default_path_and_input_overloads() {
+        let conn = open_conn().unwrap();
+        let (string_type, json_type, first): (String, String, String) = conn
+            .query_row(
+                "SELECT
+                   typeof(json_extract_array('[1, {\"a\": 2}]')),
+                   typeof(json_extract_array(JSON '[1, {\"a\": 2}]')),
+                   json_extract_array('[1, {\"a\": 2}]')[1]",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(string_type, "VARCHAR[]");
+        assert_eq!(json_type, "JSON[]");
+        assert_eq!(first, "1");
+    }
+
+    #[test]
+    fn test_to_json_string_matches_bigquery_numeric_encoding_boundaries() {
+        let conn = open_conn().unwrap();
+        let values: (String, String, String, String, String) = conn
+            .query_row(
+                "SELECT
+                   floci_to_json_string(9007199254740992::BIGINT),
+                   floci_to_json_string(9007199254740993::BIGINT),
+                   floci_to_json_string('NaN'::DOUBLE),
+                   floci_to_json_string('Infinity'::DOUBLE),
+                   floci_to_json_string('-Infinity'::DOUBLE)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(values.0, "9007199254740992");
+        assert_eq!(values.1, r#""9007199254740993""#);
+        assert_eq!(values.2, r#""NaN""#);
+        assert_eq!(values.3, r#""Infinity""#);
+        assert_eq!(values.4, r#""-Infinity""#);
+    }
+
+    #[test]
     fn test_query_returning_in_memory() {
         let conn = Connection::open_in_memory().unwrap();
         let mut stmt = conn
@@ -960,6 +2509,44 @@ mod tests {
         assert_eq!(row["d"], serde_json::json!("[Date32]"));
         assert!(row["arr"].as_str().unwrap().starts_with("[List("));
         assert_eq!(row["nan"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_ip_to_string_formats_ipv4_and_ipv6() {
+        let conn = open_conn().unwrap();
+        let (ipv4, ipv6): (String, String) = conn
+            .query_row(
+                "SELECT
+                    ip_to_string(ip_from_string('123.123.123.123')),
+                    ip_to_string(safe_ip_from_string('1111:1111:1111:1111::'))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(ipv4, "123.123.123.123");
+        assert_eq!(ipv6, "1111:1111:1111:1111::");
+    }
+
+    #[test]
+    fn test_net_functions_require_raw_ip_bytes_and_accept_int64_prefixes() {
+        let conn = open_conn().unwrap();
+        let (address, truncated): (String, Vec<u8>) = conn
+            .query_row(
+                "SELECT ip_to_string(FROM_HEX('01020304')), ip_trunc(FROM_HEX('ffff1234'), 16::BIGINT)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(address, "1.2.3.4");
+        assert_eq!(truncated, vec![0xff, 0xff, 0, 0]);
+        assert!(
+            conn.query_row("SELECT ip_to_string(CAST('AQIDBA==' AS BLOB))", [], |_| Ok(
+                ()
+            ))
+            .is_err()
+        );
     }
 
     #[test]

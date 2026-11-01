@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y \
     cmake \
     libssl-dev \
     libcurl4-openssl-dev \
-    pkg-config
+    pkg-config \
+    protobuf-compiler
 
 WORKDIR /usr/src/floci-duck
 

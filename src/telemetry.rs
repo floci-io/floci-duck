@@ -1,8 +1,8 @@
 use std::fmt;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::field::RecordFields;
-use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::FormatFields;
+use tracing_subscriber::fmt::format::Writer;
 
 /// Formats span/event fields with `correlation_id` shown as a bare value.
 /// `query{correlation_id=abc}` becomes `query{abc}`.
@@ -17,7 +17,11 @@ struct FieldVisitor<'a> {
 
 impl<'a> FieldVisitor<'a> {
     fn new(writer: Writer<'a>) -> Self {
-        Self { writer, is_empty: true, result: Ok(()) }
+        Self {
+            writer,
+            is_empty: true,
+            result: Ok(()),
+        }
     }
 
     fn write_field(&mut self, field: &Field, args: fmt::Arguments<'_>) {
@@ -31,14 +35,18 @@ impl<'a> FieldVisitor<'a> {
             "message" => {
                 if !self.is_empty {
                     self.result = write!(self.writer, " ");
-                    if self.result.is_err() { return; }
+                    if self.result.is_err() {
+                        return;
+                    }
                 }
                 self.result = write!(self.writer, "{}", args);
             }
             _ => {
                 if !self.is_empty {
                     self.result = write!(self.writer, " ");
-                    if self.result.is_err() { return; }
+                    if self.result.is_err() {
+                        return;
+                    }
                 }
                 self.result = write!(self.writer, "{}={}", field.name(), args);
             }
@@ -69,11 +77,7 @@ impl Visit for FieldVisitor<'_> {
 }
 
 impl<'writer> FormatFields<'writer> for CorrelationFields {
-    fn format_fields<R: RecordFields>(
-        &self,
-        writer: Writer<'writer>,
-        fields: R,
-    ) -> fmt::Result {
+    fn format_fields<R: RecordFields>(&self, writer: Writer<'writer>, fields: R) -> fmt::Result {
         let mut visitor = FieldVisitor::new(writer);
         fields.record(&mut visitor);
         visitor.result

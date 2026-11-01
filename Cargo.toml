@@ -6,13 +6,16 @@ edition = "2024"
 [dependencies]
 axum = "0.8.9"
 tokio = { version = "1.52.3", features = ["full"] }
-duckdb = { version = "1.10504.0", features = ["bundled", "parquet", "json", "extensions-full"] }
+duckdb = { version = "1.10504.0", features = ["bundled", "parquet", "json", "extensions-full", "vscalar"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 anyhow = "1.0.103"
+base64 = "0.22.1"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
+farmhash = "1.1.5"
+zetasketch-rs = "0.1.3"
 # Arrow IPC framing for /query responses (duckdb-rs builds arrow without the ipc feature).
 arrow-ipc = { version = "58", default-features = false }
 
