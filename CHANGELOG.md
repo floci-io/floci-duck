@@ -1,3 +1,10 @@
+# [0.4.0](https://github.com/floci-io/floci-duck/compare/0.3.0...0.4.0) (2026-11-01)
+
+
+### Features
+
+* **query:** add BigQuery-compatible execution helpers ([#8](https://github.com/floci-io/floci-duck/issues/8)) ([a959cd8](https://github.com/floci-io/floci-duck/commit/a959cd88f61b418f6199eccc6efc8f41b11ecf15))
+
 # [0.3.0](https://github.com/floci-io/floci-duck/compare/0.2.0...0.3.0) (2026-09-19)
 
 
