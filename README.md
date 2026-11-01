@@ -36,6 +36,9 @@ The executor will be available at `http://localhost:3000`.
 
 ### Local Build and Run
 
+The build needs `protoc` (provided by the `protobuf-compiler` package on Debian/Ubuntu) because
+the `zetasketch-rs` dependency generates its protobuf bindings at compile time.
+
 ```bash
 cargo build --release
 ./target/release/floci-duck
