@@ -1,3 +1,11 @@
+## [0.4.1](https://github.com/floci-io/floci-duck/compare/0.4.0...0.4.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* **ci:** install protoc for zetasketch-rs release builds ([#9](https://github.com/floci-io/floci-duck/issues/9)) ([6ee403a](https://github.com/floci-io/floci-duck/commit/6ee403a29733fa5c5969ca86d20c687dd6ea9bb1))
+* **release:** keep Cargo.lock version in sync on release ([#10](https://github.com/floci-io/floci-duck/issues/10)) ([a8cf2b2](https://github.com/floci-io/floci-duck/commit/a8cf2b29cb7019c2f93a51062ffbc0d54e19d23d)), closes [#9](https://github.com/floci-io/floci-duck/issues/9)
+
 # [0.4.0](https://github.com/floci-io/floci-duck/compare/0.3.0...0.4.0) (2026-11-01)
 
 
