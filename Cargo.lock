@@ -615,10 +615,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
-name = "farmhash"
+name = "farmhash2"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f35ce9c8fb9891c75ceadbc330752951a4e369b50af10775955aeb9af3eee34b"
+checksum = "c08c4e203d1ec89aa6b1c81b7c14ef14f1a985e2eee5e452c5c1abf66ccee9d2"
 
 [[package]]
 name = "fastrand"
@@ -672,7 +672,7 @@ dependencies = [
  "axum",
  "base64",
  "duckdb",
- "farmhash",
+ "farmhash2",
  "serde",
  "serde_json",
  "tokio",
