@@ -837,7 +837,7 @@ impl VScalar for FarmFingerprint {
             let value = DuckString::new(&mut input_value).as_bytes();
             unsafe {
                 *output_vector.as_mut_ptr::<i64>().add(index) =
-                    farmhash::fingerprint64(value) as i64;
+                    farmhash2::fingerprint64(value) as i64;
             }
         }
 
@@ -2096,6 +2096,26 @@ mod tests {
         assert_eq!(bytes, first);
         assert_eq!(null_string, None);
         assert_eq!(null_bytes, None);
+    }
+
+    #[test]
+    fn test_farm_fingerprint_hashes_inputs_longer_than_64_bytes() {
+        // Reference values from Google's farmhash Hash64 for 128 bytes: a length that is
+        // both >64 and a multiple of 64, where the `farmhash` crate loops one time too
+        // many. `farmhash2` carries that fix.
+        let conn = open_conn().unwrap();
+        let (long_string, long_bytes): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    farm_fingerprint(repeat('x', 128)),
+                    farm_fingerprint(CAST(repeat('x', 128) AS BLOB))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(long_string, 5_868_382_771_906_808_855);
+        assert_eq!(long_bytes, long_string);
     }
 
     #[test]
