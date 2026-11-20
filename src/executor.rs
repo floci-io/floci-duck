@@ -666,7 +666,7 @@ unsafe extern "C" fn hll_merge_partial_finalize(
 
 /// Registers the HLL++ aggregates on `database`. Function registration is database-scoped, so a
 /// throwaway connection registers them for the connection the crate hands back.
-fn register_hll_aggregates(database: duckdb::ffi::duckdb_database) -> anyhow::Result<()> {
+fn register_sidecar_functions(database: duckdb::ffi::duckdb_database) -> anyhow::Result<()> {
     use duckdb::ffi;
 
     unsafe {
@@ -742,9 +742,50 @@ fn register_hll_aggregates(database: duckdb::ffi::duckdb_database) -> anyhow::Re
             anyhow::bail!("could not register floci_hll_merge_partial");
         }
 
+        // floci_to_json_string needs special NULL handling so a NULL value serializes as the JSON text
+        // null; the crate's scalar registration cannot request that, so it is registered here.
+        let json_set = ffi::duckdb_create_scalar_function_set(c"floci_to_json_string".as_ptr());
+        for parameters in [
+            vec![ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
+            vec![
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
+            ],
+        ] {
+            let function = json_scalar_function(&parameters)?;
+            if ffi::duckdb_add_scalar_function_to_set(json_set, function) != ffi::DuckDBSuccess {
+                anyhow::bail!("could not add a floci_to_json_string overload");
+            }
+        }
+        if ffi::duckdb_register_scalar_function_set(registrar, json_set) != ffi::DuckDBSuccess {
+            anyhow::bail!("could not register floci_to_json_string");
+        }
+
         ffi::duckdb_disconnect(&mut registrar);
     }
     Ok(())
+}
+
+unsafe fn json_scalar_function(
+    parameters: &[duckdb::ffi::duckdb_type],
+) -> anyhow::Result<duckdb::ffi::duckdb_scalar_function> {
+    use duckdb::ffi;
+
+    let function = unsafe { ffi::duckdb_create_scalar_function() };
+    unsafe {
+        ffi::duckdb_scalar_function_set_name(function, c"floci_to_json_string".as_ptr());
+        for parameter in parameters {
+            let mut logical_type = ffi::duckdb_create_logical_type(*parameter);
+            ffi::duckdb_scalar_function_add_parameter(function, logical_type);
+            ffi::duckdb_destroy_logical_type(&mut logical_type);
+        }
+        let mut return_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+        ffi::duckdb_scalar_function_set_return_type(function, return_type);
+        ffi::duckdb_destroy_logical_type(&mut return_type);
+        ffi::duckdb_scalar_function_set_function(function, Some(floci_to_json_string));
+        ffi::duckdb_scalar_function_set_special_handling(function);
+    }
+    Ok(function)
 }
 
 unsafe fn hll_aggregate_function(
@@ -1065,65 +1106,71 @@ impl VScalar for FarmFingerprint {
     }
 }
 
-struct FlociToJsonString;
+/// `floci_to_json_string(value[, pretty_print])`, registered with special NULL handling so a NULL
+/// *value* can still serialize as the JSON text `null`: with DuckDB's default handling the function
+/// is not called for a NULL row at all, which would make `TO_JSON_STRING(NULL)` SQL NULL.
+unsafe extern "C" fn floci_to_json_string(
+    info: duckdb::ffi::duckdb_function_info,
+    input: duckdb::ffi::duckdb_data_chunk,
+    output: duckdb::ffi::duckdb_vector,
+) {
+    use duckdb::ffi;
 
-impl VScalar for FlociToJsonString {
-    type State = ();
+    let rows = unsafe { ffi::duckdb_data_chunk_get_size(input) } as usize;
+    let values = unsafe { ffi::duckdb_data_chunk_get_vector(input, 0) };
+    let pretty = (unsafe { ffi::duckdb_data_chunk_get_column_count(input) } == 2)
+        .then(|| unsafe { ffi::duckdb_data_chunk_get_vector(input, 1) });
+    let mut values_type = unsafe { ffi::duckdb_vector_get_column_type(values) };
 
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let input_vector = unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
-        let pretty_vector = (input.num_columns() == 2)
-            .then(|| unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 1) });
-        let mut input_type = unsafe { duckdb::ffi::duckdb_vector_get_column_type(input_vector) };
-        let mut output = output.flat_vector();
-
-        let result: Result<(), Box<dyn std::error::Error>> = (|| {
-            for index in 0..input.len() {
-                if pretty_vector.is_some_and(|vector| raw_vector_is_null(vector, index)) {
-                    output.set_null(index);
-                    continue;
-                }
-
-                if raw_vector_is_null(input_vector, index) {
-                    output.set_null(index);
-                    continue;
-                }
-                let value = raw_vector_to_json(input_vector, input_type, index)?;
-                let pretty = pretty_vector
-                    .map(|vector| unsafe { raw_vector_value::<bool>(vector, index) })
-                    .unwrap_or(false);
-                let json = if pretty {
-                    serde_json::to_string_pretty(&value)?
-                } else {
-                    serde_json::to_string(&value)?
-                };
-                output.insert(index, &json);
-            }
-            Ok(())
-        })();
-        unsafe {
-            duckdb::ffi::duckdb_destroy_logical_type(&mut input_type);
+    for index in 0..rows {
+        // A NULL pretty_print makes the whole call NULL, as in BigQuery.
+        if pretty.is_some_and(|vector| raw_vector_is_null(vector, index)) {
+            unsafe { json_write_null(output, index) };
+            continue;
         }
-
-        result
+        if raw_vector_is_null(values, index) {
+            unsafe { json_write_text(output, index, "null") };
+            continue;
+        }
+        let value = match raw_vector_to_json(values, values_type, index) {
+            Ok(value) => value,
+            Err(error) => {
+                unsafe { set_json_error(info, &error.to_string()) };
+                unsafe { json_write_null(output, index) };
+                continue;
+            }
+        };
+        let pretty = pretty
+            .map(|vector| unsafe { raw_vector_value::<bool>(vector, index) })
+            .unwrap_or(false);
+        let json = if pretty {
+            serde_json::to_string_pretty(&value)
+        } else {
+            serde_json::to_string(&value)
+        };
+        match json {
+            Ok(text) => unsafe { json_write_text(output, index, &text) },
+            Err(error) => {
+                unsafe { set_json_error(info, &error.to_string()) };
+                unsafe { json_write_null(output, index) };
+            }
+        }
     }
+    unsafe { ffi::duckdb_destroy_logical_type(&mut values_type) };
+}
 
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![
-            ScalarFunctionSignature::exact(
-                vec![LogicalTypeId::Any.into()],
-                LogicalTypeId::Varchar.into(),
-            ),
-            ScalarFunctionSignature::exact(
-                vec![LogicalTypeId::Any.into(), LogicalTypeId::Boolean.into()],
-                LogicalTypeId::Varchar.into(),
-            ),
-        ]
+unsafe fn set_json_error(info: duckdb::ffi::duckdb_function_info, message: &str) {
+    if let Ok(text) = std::ffi::CString::new(message) {
+        unsafe { duckdb::ffi::duckdb_scalar_function_set_error(info, text.as_ptr()) };
     }
+}
+
+unsafe fn json_write_text(vector: duckdb::ffi::duckdb_vector, index: usize, text: &str) {
+    unsafe { hll_write_blob(vector, index, text.as_bytes()) };
+}
+
+unsafe fn json_write_null(vector: duckdb::ffi::duckdb_vector, index: usize) {
+    unsafe { hll_write_null(vector, index) };
 }
 
 fn raw_vector_is_null(vector: duckdb::ffi::duckdb_vector, index: usize) -> bool {
@@ -1479,7 +1526,7 @@ fn open_conn() -> anyhow::Result<Database> {
         connection: unsafe { Connection::open_from_raw(database) }?,
         _database: RawDatabase(database),
     };
-    register_hll_aggregates(database)?;
+    register_sidecar_functions(database)?;
     // BigQuery's JSON_EXTRACT_ARRAY returns an unnestable array of JSON values.
     // DuckDB's equivalent returns one JSON value, so cast it to JSON[] for
     // compatibility with queries that immediately UNNEST the result.
@@ -1496,7 +1543,6 @@ fn open_conn() -> anyhow::Result<Database> {
     conn.register_scalar_function::<SafeIpFromString>("safe_ip_from_string")?;
     conn.register_scalar_function::<IpTrunc>("ip_trunc")?;
     conn.register_scalar_function::<FarmFingerprint>("farm_fingerprint")?;
-    conn.register_scalar_function::<FlociToJsonString>("floci_to_json_string")?;
     conn.register_scalar_function::<FlociByteLength>("floci_byte_length")?;
     conn.register_scalar_function::<FlociLength>("floci_length")?;
     conn.register_scalar_function::<BlobShiftLeft>("<<")?;
@@ -2612,7 +2658,7 @@ mod tests {
     #[test]
     fn test_floci_to_json_string_honors_pretty_print_and_propagates_nulls() {
         let conn = open_conn().unwrap();
-        let (null_value, pretty, null_pretty): (Option<String>, String, Option<String>) = conn
+        let (null_value, pretty, null_pretty): (String, String, Option<String>) = conn
             .query_row(
                 "SELECT
                    floci_to_json_string(CAST(NULL AS VARCHAR)),
@@ -2623,7 +2669,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(null_value, None);
+        assert_eq!(null_value, "null");
         assert_eq!(
             pretty,
             "{\n  \"id\": 1,\n  \"coordinates\": [\n    10,\n    20\n  ]\n}"
@@ -2639,7 +2685,7 @@ mod tests {
             String,
             String,
             String,
-            Option<String>,
+            String,
             String,
             String,
         ) = conn
@@ -2681,7 +2727,7 @@ mod tests {
             r#"{"at":"2024-01-02T03:04:05.123456Z","local_at":"2024-01-03T04:05:06","events":["2024-01-03T04:05:06Z",null]}"#
         );
         assert_eq!(ordinary_string, "\"2024-01-02 03:04:05+00\"");
-        assert_eq!(null, None);
+        assert_eq!(null, "null");
         assert_eq!(decimal, "\"123.45\"");
         assert_eq!(negative_decimal, "\"-0.0012\"");
     }
