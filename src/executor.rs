@@ -340,50 +340,484 @@ impl VScalar for BlobConcat {
     }
 }
 
-struct FlociHllInit;
+// ── HLL++ aggregates ─────────────────────────────────────────────────────────
+//
+// HLL_COUNT.INIT, HLL_COUNT.MERGE and HLL_COUNT.MERGE_PARTIAL are aggregates in BigQuery, and the
+// shims are aggregates too: the sketch lives in the aggregate state and is updated row by row, so
+// a group is sketched as its rows arrive instead of being collected into a list first.
 
-impl VScalar for FlociHllInit {
-    type State = ();
+/// One aggregate state: the sketch built so far, the precision it was built with, and whether an
+/// error was already reported for it (in which case the remaining rows are ignored).
+#[repr(C)]
+#[derive(Default)]
+struct HllState {
+    sketch: Option<HyperLogLogPlusPlus>,
+    precision: i32,
+    failed: bool,
+}
 
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use duckdb::ffi;
+unsafe extern "C" fn hll_state_size(
+    _info: duckdb::ffi::duckdb_function_info,
+) -> duckdb::ffi::idx_t {
+    std::mem::size_of::<HllState>() as duckdb::ffi::idx_t
+}
 
-        let values_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
-        let mut values_type = unsafe { ffi::duckdb_vector_get_column_type(values_vector) };
-        let precision_vector = input.flat_vector(1);
-        let precisions = unsafe { precision_vector.as_slice_with_len::<i32>(input.len()) };
-        let mut output = output.flat_vector();
+unsafe extern "C" fn hll_state_init(
+    _info: duckdb::ffi::duckdb_function_info,
+    state: duckdb::ffi::duckdb_aggregate_state,
+) {
+    unsafe { state.cast::<HllState>().write(HllState::default()) };
+}
 
-        let result: Result<(), Box<dyn std::error::Error>> = (|| {
-            for (index, precision) in precisions.iter().enumerate().take(input.len()) {
-                if raw_vector_is_null(values_vector, index)
-                    || precision_vector.row_is_null(index as u64)
-                {
-                    output.set_null(index);
-                    continue;
-                }
-                match hll_init_list(values_vector, values_type, index, *precision)? {
-                    Some(sketch) => output.insert(index, &sketch),
-                    None => output.set_null(index),
-                }
-            }
-            Ok(())
-        })();
-        unsafe {
-            ffi::duckdb_destroy_logical_type(&mut values_type);
+unsafe extern "C" fn hll_state_destroy(
+    states: *mut duckdb::ffi::duckdb_aggregate_state,
+    count: duckdb::ffi::idx_t,
+) {
+    for index in 0..count as usize {
+        let state = unsafe { *states.add(index) }.cast::<HllState>();
+        unsafe { std::ptr::drop_in_place(state) };
+    }
+}
+
+unsafe fn set_hll_error(info: duckdb::ffi::duckdb_function_info, message: &str) {
+    if let Ok(text) = std::ffi::CString::new(message) {
+        unsafe { duckdb::ffi::duckdb_aggregate_function_set_error(info, text.as_ptr()) };
+    }
+}
+
+unsafe fn hll_write_blob(vector: duckdb::ffi::duckdb_vector, index: usize, bytes: &[u8]) {
+    unsafe {
+        duckdb::ffi::duckdb_vector_assign_string_element_len(
+            vector,
+            index as duckdb::ffi::idx_t,
+            bytes.as_ptr().cast(),
+            bytes.len() as duckdb::ffi::idx_t,
+        )
+    };
+}
+
+unsafe fn hll_write_i64(vector: duckdb::ffi::duckdb_vector, index: usize, value: i64) {
+    let data = unsafe { duckdb::ffi::duckdb_vector_get_data(vector) }.cast::<i64>();
+    unsafe { data.add(index).write(value) };
+}
+
+unsafe fn hll_write_null(vector: duckdb::ffi::duckdb_vector, index: usize) {
+    unsafe { duckdb::ffi::duckdb_vector_ensure_validity_writable(vector) };
+    let validity = unsafe { duckdb::ffi::duckdb_vector_get_validity(vector) };
+    unsafe { duckdb::ffi::duckdb_validity_set_row_invalid(validity, index as duckdb::ffi::idx_t) };
+}
+
+unsafe extern "C" fn hll_init_update(
+    info: duckdb::ffi::duckdb_function_info,
+    chunk: duckdb::ffi::duckdb_data_chunk,
+    states: *mut duckdb::ffi::duckdb_aggregate_state,
+) {
+    unsafe { hll_init_update_rows(info, chunk, states, None) };
+}
+
+/// `HLL_COUNT.INIT(value)` without a precision aggregates with BigQuery's default of 15.
+unsafe extern "C" fn hll_init_default_update(
+    info: duckdb::ffi::duckdb_function_info,
+    chunk: duckdb::ffi::duckdb_data_chunk,
+    states: *mut duckdb::ffi::duckdb_aggregate_state,
+) {
+    unsafe {
+        hll_init_update_rows(
+            info,
+            chunk,
+            states,
+            Some(HyperLogLogPlusPlus::DEFAULT_NORMAL_PRECISION),
+        )
+    };
+}
+
+unsafe fn hll_init_update_rows(
+    info: duckdb::ffi::duckdb_function_info,
+    chunk: duckdb::ffi::duckdb_data_chunk,
+    states: *mut duckdb::ffi::duckdb_aggregate_state,
+    default_precision: Option<i32>,
+) {
+    let rows = unsafe { duckdb::ffi::duckdb_data_chunk_get_size(chunk) } as usize;
+    let values = unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(chunk, 0) };
+    let mut values_type = unsafe { duckdb::ffi::duckdb_vector_get_column_type(values) };
+    let values_kind = LogicalTypeId::from(unsafe { duckdb::ffi::duckdb_get_type_id(values_type) });
+    let precisions = default_precision
+        .is_none()
+        .then(|| unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(chunk, 1) });
+    let precision_data = precisions
+        .map(|vector| unsafe { duckdb::ffi::duckdb_vector_get_data(vector) }.cast::<i32>());
+
+    for index in 0..rows {
+        let state = unsafe { *states.add(index) }.cast::<HllState>();
+        if unsafe { (*state).failed } || raw_vector_is_null(values, index) {
+            continue;
         }
-        result
+        let precision = match (default_precision, precision_data) {
+            (Some(precision), _) => precision,
+            (None, Some(data)) if !raw_vector_is_null(precisions.unwrap(), index) => unsafe {
+                data.add(index).read()
+            },
+            _ => continue,
+        };
+        if let Err(message) = unsafe { hll_init_add(state, values, values_kind, index, precision) }
+        {
+            unsafe { set_hll_error(info, &message) };
+            unsafe { (*state).failed = true };
+        }
+    }
+    unsafe { duckdb::ffi::duckdb_destroy_logical_type(&mut values_type) };
+}
+
+unsafe fn hll_init_add(
+    state: *mut HllState,
+    values: duckdb::ffi::duckdb_vector,
+    kind: LogicalTypeId,
+    index: usize,
+    precision: i32,
+) -> Result<(), String> {
+    if !(HyperLogLogPlusPlus::MINIMUM_PRECISION..=HyperLogLogPlusPlus::MAXIMUM_PRECISION)
+        .contains(&precision)
+    {
+        return Err(format!(
+            "Argument 2 to HLL_COUNT.INIT must be between {} and {}",
+            HyperLogLogPlusPlus::MINIMUM_PRECISION,
+            HyperLogLogPlusPlus::MAXIMUM_PRECISION
+        ));
+    }
+    let state = unsafe { &mut *state };
+    if state.sketch.is_none() {
+        let builder = HyperLogLogPlusPlus::builder()
+            .normal_precision(precision)
+            .sparse_precision(hll_sparse_precision(precision));
+        let sketch = match kind {
+            LogicalTypeId::Varchar => builder.build_for_string(),
+            LogicalTypeId::Blob => builder.build_for_bytes(),
+            LogicalTypeId::Tinyint
+            | LogicalTypeId::Smallint
+            | LogicalTypeId::Integer
+            | LogicalTypeId::Bigint => builder.build_for_u64(),
+            other => return Err(format!("HLL_COUNT.INIT does not support {other:?}")),
+        };
+        state.sketch = Some(sketch.map_err(|error| error.to_string())?);
+        state.precision = precision;
+    } else if state.precision != precision {
+        return Err("Argument 2 to HLL_COUNT.INIT must be constant".into());
     }
 
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeId::Any.into(), LogicalTypeId::Integer.into()],
-            LogicalTypeId::Blob.into(),
-        )]
+    let sketch = state.sketch.as_mut().expect("the sketch was just built");
+    match kind {
+        LogicalTypeId::Varchar => {
+            let mut value =
+                unsafe { raw_vector_value::<duckdb::ffi::duckdb_string_t>(values, index) };
+            sketch.add_string(DuckString::new(&mut value).as_str().as_ref())
+        }
+        LogicalTypeId::Blob => {
+            let mut value =
+                unsafe { raw_vector_value::<duckdb::ffi::duckdb_string_t>(values, index) };
+            sketch.add_bytes(DuckString::new(&mut value).as_bytes())
+        }
+        LogicalTypeId::Tinyint => {
+            sketch.add_i64(unsafe { raw_vector_value::<i8>(values, index) } as i64)
+        }
+        LogicalTypeId::Smallint => {
+            sketch.add_i64(unsafe { raw_vector_value::<i16>(values, index) } as i64)
+        }
+        LogicalTypeId::Integer => {
+            sketch.add_i64(unsafe { raw_vector_value::<i32>(values, index) } as i64)
+        }
+        LogicalTypeId::Bigint => sketch.add_i64(unsafe { raw_vector_value::<i64>(values, index) }),
+        other => return Err(format!("HLL_COUNT.INIT does not support {other:?}")),
+    }
+    .map_err(|error| error.to_string())
+}
+
+unsafe extern "C" fn hll_merge_update(
+    info: duckdb::ffi::duckdb_function_info,
+    chunk: duckdb::ffi::duckdb_data_chunk,
+    states: *mut duckdb::ffi::duckdb_aggregate_state,
+) {
+    let rows = unsafe { duckdb::ffi::duckdb_data_chunk_get_size(chunk) } as usize;
+    let values = unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(chunk, 0) };
+
+    for index in 0..rows {
+        let state = unsafe { *states.add(index) }.cast::<HllState>();
+        if unsafe { (*state).failed } || raw_vector_is_null(values, index) {
+            continue;
+        }
+        let mut value = unsafe { raw_vector_value::<duckdb::ffi::duckdb_string_t>(values, index) };
+        let sketch = match parse_hll(DuckString::new(&mut value).as_bytes()) {
+            Ok(sketch) => sketch,
+            Err(error) => {
+                unsafe { set_hll_error(info, &error.to_string()) };
+                unsafe { (*state).failed = true };
+                continue;
+            }
+        };
+        let state = unsafe { &mut *state };
+        let error = match &mut state.sketch {
+            Some(current) => current.merge_aggregator(sketch).err(),
+            None => {
+                state.sketch = Some(sketch);
+                None
+            }
+        };
+        if let Some(error) = error {
+            unsafe { set_hll_error(info, &error.to_string()) };
+            state.failed = true;
+        }
+    }
+}
+
+unsafe extern "C" fn hll_combine(
+    _info: duckdb::ffi::duckdb_function_info,
+    source: *mut duckdb::ffi::duckdb_aggregate_state,
+    target: *mut duckdb::ffi::duckdb_aggregate_state,
+    count: duckdb::ffi::idx_t,
+) {
+    for index in 0..count as usize {
+        let source = unsafe { *source.add(index) }.cast::<HllState>();
+        let target = unsafe { *target.add(index) }.cast::<HllState>();
+        let (source, target) = unsafe { (&*source, &mut *target) };
+        if target.failed {
+            continue;
+        }
+        match &mut target.sketch {
+            // The source state keeps its own sketch and is destroyed by DuckDB afterwards.
+            Some(current) => {
+                if let Some(sketch) = source.sketch.clone() {
+                    let _ = current.merge_aggregator(sketch);
+                }
+            }
+            None => {
+                target.sketch = source.sketch.clone();
+                target.precision = source.precision;
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn hll_init_finalize(
+    info: duckdb::ffi::duckdb_function_info,
+    source: *mut duckdb::ffi::duckdb_aggregate_state,
+    result: duckdb::ffi::duckdb_vector,
+    count: duckdb::ffi::idx_t,
+    offset: duckdb::ffi::idx_t,
+) {
+    for row in 0..count as usize {
+        let state = unsafe { &*source.add(row).read().cast::<HllState>() };
+        let index = offset as usize + row;
+        match state.sketch.clone() {
+            Some(sketch) => match sketch.serialize_to_bytes() {
+                Ok(bytes) => unsafe { hll_write_blob(result, index, &bytes) },
+                Err(error) => {
+                    unsafe { set_hll_error(info, &error.to_string()) };
+                    unsafe { hll_write_null(result, index) };
+                }
+            },
+            // No non-NULL rows: BigQuery's HLL_COUNT.INIT is NULL for that group.
+            None => unsafe { hll_write_null(result, index) },
+        }
+    }
+}
+
+unsafe extern "C" fn hll_merge_finalize(
+    info: duckdb::ffi::duckdb_function_info,
+    source: *mut duckdb::ffi::duckdb_aggregate_state,
+    result: duckdb::ffi::duckdb_vector,
+    count: duckdb::ffi::idx_t,
+    offset: duckdb::ffi::idx_t,
+) {
+    for row in 0..count as usize {
+        let state = unsafe { &*source.add(row).read().cast::<HllState>() };
+        let index = offset as usize + row;
+        let estimate = match state.sketch.as_ref() {
+            Some(sketch) => sketch.result().unwrap_or_else(|error| {
+                unsafe { set_hll_error(info, &error.to_string()) };
+                0
+            }),
+            None => 0,
+        };
+        unsafe { hll_write_i64(result, index, estimate) };
+    }
+}
+
+unsafe extern "C" fn hll_merge_partial_finalize(
+    info: duckdb::ffi::duckdb_function_info,
+    source: *mut duckdb::ffi::duckdb_aggregate_state,
+    result: duckdb::ffi::duckdb_vector,
+    count: duckdb::ffi::idx_t,
+    offset: duckdb::ffi::idx_t,
+) {
+    for row in 0..count as usize {
+        let state = unsafe { &*source.add(row).read().cast::<HllState>() };
+        let index = offset as usize + row;
+        match state.sketch.clone() {
+            Some(sketch) => match sketch.serialize_to_bytes() {
+                Ok(bytes) => unsafe { hll_write_blob(result, index, &bytes) },
+                Err(error) => {
+                    unsafe { set_hll_error(info, &error.to_string()) };
+                    unsafe { hll_write_null(result, index) };
+                }
+            },
+            None => unsafe { hll_write_null(result, index) },
+        }
+    }
+}
+
+/// Registers the HLL++ aggregates on `database`. Function registration is database-scoped, so a
+/// throwaway connection registers them for the connection the crate hands back.
+fn register_sidecar_functions(database: duckdb::ffi::duckdb_database) -> anyhow::Result<()> {
+    use duckdb::ffi;
+
+    unsafe {
+        let mut registrar: ffi::duckdb_connection = std::ptr::null_mut();
+        if ffi::duckdb_connect(database, &mut registrar) != ffi::DuckDBSuccess {
+            anyhow::bail!("could not open a connection to register the HLL aggregate functions");
+        }
+
+        let init_set = ffi::duckdb_create_aggregate_function_set(c"floci_hll_init".as_ptr());
+        // A DECIMAL argument matches none of these overloads and DuckDB answers with the binder
+        // error for the call, which is how NUMERIC/BIGNUMERIC initialization is refused.
+        for value_type in [
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+        ] {
+            let function = hll_aggregate_function(
+                c"floci_hll_init",
+                &[value_type, ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER],
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+                Some(hll_init_update),
+                Some(hll_init_finalize),
+            );
+            if ffi::duckdb_add_aggregate_function_to_set(init_set, function) != ffi::DuckDBSuccess {
+                anyhow::bail!("could not add the floci_hll_init overload for {value_type}");
+            }
+            let default_function = hll_aggregate_function(
+                c"floci_hll_init",
+                &[value_type],
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+                Some(hll_init_default_update),
+                Some(hll_init_finalize),
+            );
+            if ffi::duckdb_add_aggregate_function_to_set(init_set, default_function)
+                != ffi::DuckDBSuccess
+            {
+                anyhow::bail!("could not add the floci_hll_init(value) overload for {value_type}");
+            }
+        }
+        if ffi::duckdb_register_aggregate_function_set(registrar, init_set) != ffi::DuckDBSuccess {
+            anyhow::bail!("could not register floci_hll_init");
+        }
+
+        let merge_set = ffi::duckdb_create_aggregate_function_set(c"floci_hll_merge".as_ptr());
+        let merge = hll_aggregate_function(
+            c"floci_hll_merge",
+            &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB],
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+            Some(hll_merge_update),
+            Some(hll_merge_finalize),
+        );
+        if ffi::duckdb_add_aggregate_function_to_set(merge_set, merge) != ffi::DuckDBSuccess {
+            anyhow::bail!("could not add the floci_hll_merge overload");
+        }
+        if ffi::duckdb_register_aggregate_function_set(registrar, merge_set) != ffi::DuckDBSuccess {
+            anyhow::bail!("could not register floci_hll_merge");
+        }
+
+        let partial_set =
+            ffi::duckdb_create_aggregate_function_set(c"floci_hll_merge_partial".as_ptr());
+        let partial = hll_aggregate_function(
+            c"floci_hll_merge_partial",
+            &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB],
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+            Some(hll_merge_update),
+            Some(hll_merge_partial_finalize),
+        );
+        if ffi::duckdb_add_aggregate_function_to_set(partial_set, partial) != ffi::DuckDBSuccess {
+            anyhow::bail!("could not add the floci_hll_merge_partial overload");
+        }
+        if ffi::duckdb_register_aggregate_function_set(registrar, partial_set) != ffi::DuckDBSuccess
+        {
+            anyhow::bail!("could not register floci_hll_merge_partial");
+        }
+
+        // floci_to_json_string needs special NULL handling so a NULL value serializes as the JSON text
+        // null; the crate's scalar registration cannot request that, so it is registered here.
+        let json_set = ffi::duckdb_create_scalar_function_set(c"floci_to_json_string".as_ptr());
+        for parameters in [
+            vec![ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
+            vec![
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
+            ],
+        ] {
+            let function = json_scalar_function(&parameters)?;
+            if ffi::duckdb_add_scalar_function_to_set(json_set, function) != ffi::DuckDBSuccess {
+                anyhow::bail!("could not add a floci_to_json_string overload");
+            }
+        }
+        if ffi::duckdb_register_scalar_function_set(registrar, json_set) != ffi::DuckDBSuccess {
+            anyhow::bail!("could not register floci_to_json_string");
+        }
+
+        ffi::duckdb_disconnect(&mut registrar);
+    }
+    Ok(())
+}
+
+unsafe fn json_scalar_function(
+    parameters: &[duckdb::ffi::duckdb_type],
+) -> anyhow::Result<duckdb::ffi::duckdb_scalar_function> {
+    use duckdb::ffi;
+
+    let function = unsafe { ffi::duckdb_create_scalar_function() };
+    unsafe {
+        ffi::duckdb_scalar_function_set_name(function, c"floci_to_json_string".as_ptr());
+        for parameter in parameters {
+            let mut logical_type = ffi::duckdb_create_logical_type(*parameter);
+            ffi::duckdb_scalar_function_add_parameter(function, logical_type);
+            ffi::duckdb_destroy_logical_type(&mut logical_type);
+        }
+        let mut return_type = ffi::duckdb_create_logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+        ffi::duckdb_scalar_function_set_return_type(function, return_type);
+        ffi::duckdb_destroy_logical_type(&mut return_type);
+        ffi::duckdb_scalar_function_set_function(function, Some(floci_to_json_string));
+        ffi::duckdb_scalar_function_set_special_handling(function);
+    }
+    Ok(function)
+}
+
+unsafe fn hll_aggregate_function(
+    name: &std::ffi::CStr,
+    parameters: &[duckdb::ffi::duckdb_type],
+    returns: duckdb::ffi::duckdb_type,
+    update: duckdb::ffi::duckdb_aggregate_update_t,
+    finalize: duckdb::ffi::duckdb_aggregate_finalize_t,
+) -> duckdb::ffi::duckdb_aggregate_function {
+    use duckdb::ffi;
+
+    unsafe {
+        let function = ffi::duckdb_create_aggregate_function();
+        ffi::duckdb_aggregate_function_set_name(function, name.as_ptr());
+        for parameter in parameters {
+            let mut logical_type = ffi::duckdb_create_logical_type(*parameter);
+            ffi::duckdb_aggregate_function_add_parameter(function, logical_type);
+            ffi::duckdb_destroy_logical_type(&mut logical_type);
+        }
+        let mut return_type = ffi::duckdb_create_logical_type(returns);
+        ffi::duckdb_aggregate_function_set_return_type(function, return_type);
+        ffi::duckdb_destroy_logical_type(&mut return_type);
+        ffi::duckdb_aggregate_function_set_functions(
+            function,
+            Some(hll_state_size),
+            Some(hll_state_init),
+            update,
+            Some(hll_combine),
+            finalize,
+        );
+        ffi::duckdb_aggregate_function_set_destructor(function, Some(hll_state_destroy));
+        function
     }
 }
 
@@ -421,214 +855,17 @@ impl VScalar for FlociHllExtract {
     }
 }
 
-struct FlociHllMerge;
-
-impl VScalar for FlociHllMerge {
-    type State = ();
-
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        invoke_hll_merge(input, output, false)
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeId::Any.into()],
-            LogicalTypeId::Bigint.into(),
-        )]
-    }
-}
-
-struct FlociHllMergePartial;
-
-impl VScalar for FlociHllMergePartial {
-    type State = ();
-
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        invoke_hll_merge(input, output, true)
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeId::Any.into()],
-            LogicalTypeId::Blob.into(),
-        )]
-    }
-}
-
-fn hll_init_list(
-    vector: duckdb::ffi::duckdb_vector,
-    logical_type: duckdb::ffi::duckdb_logical_type,
-    index: usize,
-    precision: i32,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
-    use duckdb::ffi;
-
-    if LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(logical_type) }) != LogicalTypeId::List
-    {
-        return Err("floci_hll_init requires a LIST argument".into());
-    }
-    let entry = unsafe { raw_vector_value::<ffi::duckdb_list_entry>(vector, index) };
-    // HLL_COUNT.INIT is NULL for an aggregate group with no non-NULL inputs.
-    // The translator removes NULLs before calling this scalar shim, so an empty
-    // list represents both the all-NULL and empty-input aggregate cases.
-    if entry.length == 0 {
-        return Ok(None);
-    }
-    let child_vector = unsafe { ffi::duckdb_list_vector_get_child(vector) };
-    let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
-    let child_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(child_type) });
-
-    let result =
-        (|| {
-            let builder = HyperLogLogPlusPlus::builder().normal_precision(precision);
-            let mut sketch = match child_type_id {
-                LogicalTypeId::Varchar => builder.build_for_string()?,
-                LogicalTypeId::Blob => builder.build_for_bytes()?,
-                LogicalTypeId::Tinyint
-                | LogicalTypeId::Smallint
-                | LogicalTypeId::Integer
-                | LogicalTypeId::Bigint => builder.build_for_u64()?,
-                other => return Err(format!("HLL_COUNT.INIT does not support {other:?}").into()),
-            };
-
-            for child_index in entry.offset..entry.offset + entry.length {
-                let child_index = child_index as usize;
-                if raw_vector_is_null(child_vector, child_index) {
-                    continue;
-                }
-                match child_type_id {
-                    LogicalTypeId::Varchar => {
-                        let mut value = unsafe {
-                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
-                        };
-                        sketch.add_string(DuckString::new(&mut value).as_str().as_ref())?;
-                    }
-                    LogicalTypeId::Blob => {
-                        let mut value = unsafe {
-                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
-                        };
-                        sketch.add_bytes(DuckString::new(&mut value).as_bytes())?;
-                    }
-                    LogicalTypeId::Tinyint => {
-                        sketch.add_i64(
-                            unsafe { raw_vector_value::<i8>(child_vector, child_index) } as i64,
-                        )?
-                    }
-                    LogicalTypeId::Smallint => sketch.add_i64(unsafe {
-                        raw_vector_value::<i16>(child_vector, child_index)
-                    } as i64)?,
-                    LogicalTypeId::Integer => sketch.add_i64(unsafe {
-                        raw_vector_value::<i32>(child_vector, child_index)
-                    } as i64)?,
-                    LogicalTypeId::Bigint => sketch
-                        .add_i64(unsafe { raw_vector_value::<i64>(child_vector, child_index) })?,
-                    _ => unreachable!(),
-                }
-            }
-            Ok(Some(sketch.serialize_to_bytes()?))
-        })();
-    unsafe {
-        ffi::duckdb_destroy_logical_type(&mut child_type);
-    }
-    result
+/// BigQuery's HLL++ sketches keep the sparse precision five bits wider than the normal one, but
+/// the serialized proto caps it at 25 ("Accepted values are in the range [p, 25]"). Asking the
+/// sketch library for the default `normal + 5` therefore fails for BigQuery's precisions 21-24,
+/// so the sparse precision is clamped to the maximum instead.
+fn hll_sparse_precision(normal_precision: i32) -> i32 {
+    (normal_precision + HyperLogLogPlusPlus::DEFAULT_SPARSE_PRECISION_DELTA)
+        .min(HyperLogLogPlusPlus::MAXIMUM_SPARSE_PRECISION)
 }
 
 fn parse_hll(bytes: &[u8]) -> Result<HyperLogLogPlusPlus, Box<dyn std::error::Error>> {
     Ok(HyperLogLogPlusPlus::from_bytes(bytes)?)
-}
-
-fn merged_hll_list(
-    vector: duckdb::ffi::duckdb_vector,
-    logical_type: duckdb::ffi::duckdb_logical_type,
-    index: usize,
-) -> Result<Option<HyperLogLogPlusPlus>, Box<dyn std::error::Error>> {
-    use duckdb::ffi;
-
-    if LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(logical_type) }) != LogicalTypeId::List
-    {
-        return Err("HLL_COUNT.MERGE requires a LIST argument".into());
-    }
-    let entry = unsafe { raw_vector_value::<ffi::duckdb_list_entry>(vector, index) };
-    let child_vector = unsafe { ffi::duckdb_list_vector_get_child(vector) };
-    let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
-    let child_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(child_type) });
-    if child_type_id != LogicalTypeId::Blob {
-        unsafe { ffi::duckdb_destroy_logical_type(&mut child_type) };
-        return Err(format!("HLL_COUNT.MERGE requires BYTES, found {child_type_id:?}").into());
-    }
-
-    let result = (|| {
-        let mut merged: Option<HyperLogLogPlusPlus> = None;
-        for child_index in entry.offset..entry.offset + entry.length {
-            let child_index = child_index as usize;
-            if raw_vector_is_null(child_vector, child_index) {
-                continue;
-            }
-            let mut value =
-                unsafe { raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index) };
-            let sketch = parse_hll(DuckString::new(&mut value).as_bytes())?;
-            if let Some(current) = &mut merged {
-                current.merge_aggregator(sketch)?;
-            } else {
-                merged = Some(sketch);
-            }
-        }
-        Ok(merged)
-    })();
-    unsafe {
-        ffi::duckdb_destroy_logical_type(&mut child_type);
-    }
-    result
-}
-
-fn invoke_hll_merge(
-    input: &mut DataChunkHandle,
-    output: &mut dyn WritableVector,
-    partial: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use duckdb::ffi;
-
-    let input_vector = unsafe { ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
-    let mut input_type = unsafe { ffi::duckdb_vector_get_column_type(input_vector) };
-    let mut output = output.flat_vector();
-    let result = (|| {
-        for index in 0..input.len() {
-            if raw_vector_is_null(input_vector, index) {
-                if partial {
-                    output.set_null(index);
-                } else {
-                    unsafe { *output.as_mut_ptr::<i64>().add(index) = 0 };
-                }
-                continue;
-            }
-            let merged = merged_hll_list(input_vector, input_type, index)?;
-            if partial {
-                match merged {
-                    Some(sketch) => output.insert(index, &sketch.serialize_to_bytes()?),
-                    None => output.set_null(index),
-                }
-            } else {
-                let estimate = match merged {
-                    Some(sketch) => sketch.result()?,
-                    None => 0,
-                };
-                unsafe { *output.as_mut_ptr::<i64>().add(index) = estimate };
-            }
-        }
-        Ok(())
-    })();
-    unsafe {
-        ffi::duckdb_destroy_logical_type(&mut input_type);
-    }
-    result
 }
 
 struct IpToString;
@@ -655,7 +892,13 @@ impl VScalar for IpToString {
             let address = match bytes.len() {
                 4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(bytes)?)),
                 16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes)?)),
-                _ => return Err("NET.IP_TO_STRING requires a 4-byte or 16-byte address".into()),
+                _ => {
+                    return Err(format!(
+                        "NET.IP_TO_STRING() encountered an invalid IP address. Expected 4 (for IPv4) or 16 (for IPv6) bytes but got {}",
+                        bytes.len()
+                    )
+                    .into());
+                }
             };
             output.insert(index, address.to_string().as_str());
         }
@@ -693,9 +936,10 @@ impl VScalar for IpFromString {
             }
 
             let mut input_value = *input_value;
-            let address = DuckString::new(&mut input_value)
-                .as_str()
-                .parse::<IpAddr>()?;
+            let text = DuckString::new(&mut input_value).as_str().into_owned();
+            let address = text.parse::<IpAddr>().map_err(|_| {
+                format!("NET.IP_FROM_STRING() encountered an unparseable IP-address: {text}")
+            })?;
             match address {
                 IpAddr::V4(address) => output_vector.insert(index, address.octets().as_slice()),
                 IpAddr::V6(address) => output_vector.insert(index, address.octets().as_slice()),
@@ -778,12 +1022,16 @@ impl VScalar for IpTrunc {
             let maximum_bits = match bytes.len() {
                 4 => 32,
                 16 => 128,
-                _ => return Err("NET.IP_TRUNC requires a 4-byte or 16-byte address".into()),
+                length => {
+                    return Err(format!(
+                        "The first argument of NET.IP_TRUNC() must have length 4 (for IPv4) or 16 (for IPv6); got {length}"
+                    )
+                    .into());
+                }
             };
             if prefix < 0 || prefix > maximum_bits {
                 return Err(format!(
-                    "NET.IP_TRUNC prefix length {prefix} is invalid for a {}-byte address",
-                    bytes.len()
+                    "The second argument of NET.IP_TRUNC() must be between 0 and 8 * LENGTH(first argument); got {prefix}"
                 )
                 .into());
             }
@@ -858,65 +1106,71 @@ impl VScalar for FarmFingerprint {
     }
 }
 
-struct FlociToJsonString;
+/// `floci_to_json_string(value[, pretty_print])`, registered with special NULL handling so a NULL
+/// *value* can still serialize as the JSON text `null`: with DuckDB's default handling the function
+/// is not called for a NULL row at all, which would make `TO_JSON_STRING(NULL)` SQL NULL.
+unsafe extern "C" fn floci_to_json_string(
+    info: duckdb::ffi::duckdb_function_info,
+    input: duckdb::ffi::duckdb_data_chunk,
+    output: duckdb::ffi::duckdb_vector,
+) {
+    use duckdb::ffi;
 
-impl VScalar for FlociToJsonString {
-    type State = ();
+    let rows = unsafe { ffi::duckdb_data_chunk_get_size(input) } as usize;
+    let values = unsafe { ffi::duckdb_data_chunk_get_vector(input, 0) };
+    let pretty = (unsafe { ffi::duckdb_data_chunk_get_column_count(input) } == 2)
+        .then(|| unsafe { ffi::duckdb_data_chunk_get_vector(input, 1) });
+    let mut values_type = unsafe { ffi::duckdb_vector_get_column_type(values) };
 
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let input_vector = unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 0) };
-        let pretty_vector = (input.num_columns() == 2)
-            .then(|| unsafe { duckdb::ffi::duckdb_data_chunk_get_vector(input.get_ptr(), 1) });
-        let mut input_type = unsafe { duckdb::ffi::duckdb_vector_get_column_type(input_vector) };
-        let mut output = output.flat_vector();
-
-        let result: Result<(), Box<dyn std::error::Error>> = (|| {
-            for index in 0..input.len() {
-                if pretty_vector.is_some_and(|vector| raw_vector_is_null(vector, index)) {
-                    output.set_null(index);
-                    continue;
-                }
-
-                if raw_vector_is_null(input_vector, index) {
-                    output.set_null(index);
-                    continue;
-                }
-                let value = raw_vector_to_json(input_vector, input_type, index)?;
-                let pretty = pretty_vector
-                    .map(|vector| unsafe { raw_vector_value::<bool>(vector, index) })
-                    .unwrap_or(false);
-                let json = if pretty {
-                    serde_json::to_string_pretty(&value)?
-                } else {
-                    serde_json::to_string(&value)?
-                };
-                output.insert(index, &json);
-            }
-            Ok(())
-        })();
-        unsafe {
-            duckdb::ffi::duckdb_destroy_logical_type(&mut input_type);
+    for index in 0..rows {
+        // A NULL pretty_print makes the whole call NULL, as in BigQuery.
+        if pretty.is_some_and(|vector| raw_vector_is_null(vector, index)) {
+            unsafe { json_write_null(output, index) };
+            continue;
         }
-
-        result
+        if raw_vector_is_null(values, index) {
+            unsafe { json_write_text(output, index, "null") };
+            continue;
+        }
+        let value = match raw_vector_to_json(values, values_type, index) {
+            Ok(value) => value,
+            Err(error) => {
+                unsafe { set_json_error(info, &error.to_string()) };
+                unsafe { json_write_null(output, index) };
+                continue;
+            }
+        };
+        let pretty = pretty
+            .map(|vector| unsafe { raw_vector_value::<bool>(vector, index) })
+            .unwrap_or(false);
+        let json = if pretty {
+            serde_json::to_string_pretty(&value)
+        } else {
+            serde_json::to_string(&value)
+        };
+        match json {
+            Ok(text) => unsafe { json_write_text(output, index, &text) },
+            Err(error) => {
+                unsafe { set_json_error(info, &error.to_string()) };
+                unsafe { json_write_null(output, index) };
+            }
+        }
     }
+    unsafe { ffi::duckdb_destroy_logical_type(&mut values_type) };
+}
 
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![
-            ScalarFunctionSignature::exact(
-                vec![LogicalTypeId::Any.into()],
-                LogicalTypeId::Varchar.into(),
-            ),
-            ScalarFunctionSignature::exact(
-                vec![LogicalTypeId::Any.into(), LogicalTypeId::Boolean.into()],
-                LogicalTypeId::Varchar.into(),
-            ),
-        ]
+unsafe fn set_json_error(info: duckdb::ffi::duckdb_function_info, message: &str) {
+    if let Ok(text) = std::ffi::CString::new(message) {
+        unsafe { duckdb::ffi::duckdb_scalar_function_set_error(info, text.as_ptr()) };
     }
+}
+
+unsafe fn json_write_text(vector: duckdb::ffi::duckdb_vector, index: usize, text: &str) {
+    unsafe { hll_write_blob(vector, index, text.as_bytes()) };
+}
+
+unsafe fn json_write_null(vector: duckdb::ffi::duckdb_vector, index: usize) {
+    unsafe { hll_write_null(vector, index) };
 }
 
 fn raw_vector_is_null(vector: duckdb::ffi::duckdb_vector, index: usize) -> bool {
@@ -1081,7 +1335,7 @@ fn raw_decimal_to_json(
 
     let negative = raw < 0;
     let digits = raw.unsigned_abs().to_string();
-    let number = if scale == 0 {
+    let mut number = if scale == 0 {
         digits
     } else if digits.len() <= scale {
         format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
@@ -1089,12 +1343,26 @@ fn raw_decimal_to_json(
         let split = digits.len() - scale;
         format!("{}.{}", &digits[..split], &digits[split..])
     };
-    let json_number = if negative {
+    // BigQuery drops the trailing zeros of the scale: NUMERIC '1.50' serializes as 1.5.
+    if number.contains('.') {
+        number = number
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+    }
+    let canonical = if negative && number != "0" {
         format!("-{number}")
     } else {
         number
     };
-    Ok(serde_json::from_str(&json_number)?)
+    // BigQuery serializes a NUMERIC/BIGNUMERIC with a fractional part as a JSON string and an
+    // integral one as a JSON number, so `TO_JSON_STRING(NUMERIC '1.5')` is "\"1.5\"" while
+    // `TO_JSON_STRING(NUMERIC '1.0')` is `1`.
+    if canonical.contains('.') {
+        Ok(serde_json::Value::String(canonical))
+    } else {
+        Ok(serde_json::from_str(&canonical)?)
+    }
 }
 
 fn float_to_json(value: f64) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -1220,8 +1488,45 @@ fn apply_variables(sql: &str, variables: &std::collections::HashMap<String, Stri
     result
 }
 
-fn open_conn() -> anyhow::Result<Connection> {
-    let conn = Connection::open_in_memory()?;
+/// A per-request DuckDB database with the crate's connection on it. The database is opened through
+/// the C API because the HLL aggregates are registered on it: registration lives in the database
+/// catalog, and the crate keeps its connection handle private.
+struct Database {
+    connection: Connection,
+    // Declared after `connection` so the fields drop in order: the connection is disconnected
+    // before the database is closed.
+    _database: RawDatabase,
+}
+
+struct RawDatabase(duckdb::ffi::duckdb_database);
+
+impl Drop for RawDatabase {
+    fn drop(&mut self) {
+        unsafe { duckdb::ffi::duckdb_close(&mut self.0) };
+    }
+}
+
+impl std::ops::Deref for Database {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+fn open_conn() -> anyhow::Result<Database> {
+    let database = unsafe {
+        let mut handle: duckdb::ffi::duckdb_database = std::ptr::null_mut();
+        if duckdb::ffi::duckdb_open(std::ptr::null(), &mut handle) != duckdb::ffi::DuckDBSuccess {
+            anyhow::bail!("could not open the in-memory DuckDB database");
+        }
+        handle
+    };
+    let conn = Database {
+        connection: unsafe { Connection::open_from_raw(database) }?,
+        _database: RawDatabase(database),
+    };
+    register_sidecar_functions(database)?;
     // BigQuery's JSON_EXTRACT_ARRAY returns an unnestable array of JSON values.
     // DuckDB's equivalent returns one JSON value, so cast it to JSON[] for
     // compatibility with queries that immediately UNNEST the result.
@@ -1238,7 +1543,6 @@ fn open_conn() -> anyhow::Result<Connection> {
     conn.register_scalar_function::<SafeIpFromString>("safe_ip_from_string")?;
     conn.register_scalar_function::<IpTrunc>("ip_trunc")?;
     conn.register_scalar_function::<FarmFingerprint>("farm_fingerprint")?;
-    conn.register_scalar_function::<FlociToJsonString>("floci_to_json_string")?;
     conn.register_scalar_function::<FlociByteLength>("floci_byte_length")?;
     conn.register_scalar_function::<FlociLength>("floci_length")?;
     conn.register_scalar_function::<BlobShiftLeft>("<<")?;
@@ -1246,10 +1550,7 @@ fn open_conn() -> anyhow::Result<Connection> {
     conn.register_scalar_function::<BlobBitCount>("bit_count")?;
     conn.register_scalar_function::<BlobRepeat>("repeat")?;
     conn.register_scalar_function::<BlobConcat>("concat")?;
-    conn.register_scalar_function::<FlociHllInit>("floci_hll_init")?;
     conn.register_scalar_function::<FlociHllExtract>("floci_hll_extract")?;
-    conn.register_scalar_function::<FlociHllMerge>("floci_hll_merge")?;
-    conn.register_scalar_function::<FlociHllMergePartial>("floci_hll_merge_partial")?;
     if let Ok(ext_dir) = env::var("FLOCI_DUCK_EXT_DIR") {
         info!("Setting extension directory to: {}", ext_dir);
         conn.execute_batch(&format!(
@@ -2104,12 +2405,12 @@ mod tests {
         let (serialized, extracted, merged_raw): (String, i64, i64) = conn
             .query_row(
                 "SELECT
-                    to_base64(floci_hll_init(['ip1'], 15)),
+                    (SELECT to_base64(floci_hll_init(name, 15)) FROM (VALUES ('ip1')) AS input(name)),
                     floci_hll_extract(from_base64('CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==')),
-                    floci_hll_merge([
-                        from_base64('CHAQARgCIAiCBwsQARgPIBQyA5ajLg=='),
-                        from_base64('CHAQAhgCIAiCBw8QAhgPIBQyB6z8INWlrwE=')
-                    ])",
+                    (SELECT floci_hll_merge(sketch) FROM (VALUES
+                        (from_base64('CHAQARgCIAiCBwsQARgPIBQyA5ajLg==')),
+                        (from_base64('CHAQAhgCIAiCBw8QAhgPIBQyB6z8INWlrwE='))
+                    ) AS input(sketch))",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -2119,6 +2420,90 @@ mod tests {
         assert_eq!(extracted, 1);
         assert_eq!(merged_raw, 3);
         assert!(parse_hll(b"CHAQARgCIAuCBwsQARgPIBQyA9bwNQ==").is_err());
+    }
+
+    #[test]
+    fn test_hll_init_precisions_reproduce_bigquery_sketch_bytes() {
+        // Sketches of UNNEST([1, 2, 3]) produced by live BigQuery's HLL_COUNT.INIT(x, p) for
+        // every precision it accepts. The sparse precision is capped at 25, so precisions
+        // 21-24 would otherwise ask the sketch library for `normal + 5` and fail.
+        let bigquery_sketches = [
+            (10, "CHAQAxgCIAiCBw8QAxgKIA8yB/GDAdMcyBg="),
+            (11, "CHAQAxgCIAiCBw8QAxgLIBAyB+KHAqY5kTE="),
+            (12, "CHAQAxgCIAiCBw8QAxgMIBEyB8WPBMtyomI="),
+            (13, "CHAQAxgCIAiCBxEQAxgNIBIyCYufCNqpA96/KA=="),
+            (14, "CHAQAxgCIAiCBxEQAxgOIBMyCZa+ELXTBrf/UA=="),
+            (15, "CHAQAxgCIAiCBxIQAxgPIBQyCqz8IOqmDev+oQE="),
+            (16, "CHAQAxgCIAiCBxEQAxgQIBUyCdj4QampDqykDA=="),
+            (17, "CHAQAxgCIAiCBxIQAxgRIBYyCrDxgwHS0hzYyBg="),
+            (18, "CHAQAxgCIAiCBxMQAxgSIBcyC4SIwQKwkTGNrJ0J"),
+            (19, "CHAQAxgCIAiCBxIQAxgTIBgyCsHFjwTHynLgomI="),
+            (20, "CHAQAxgCIAiCBxQQAxgUIBkyDIOLnwiNleUBwcXEAQ=="),
+            (21, "CHAQAxgCIAiCBxQQAxgVIBkyDIOLnwjO2qkD8JrIXA=="),
+            (22, "CHAQAxgCIAiCBxUQAxgWIBkyDYOLnwjO2qkDsJvZxAE="),
+            (23, "CHAQAxgCIAiCBxUQAxgXIBkyDYOLnwjO2qkDsJz7lAM="),
+            (24, "CHAQAxgCIAiCBxUQAxgYIBkyDYOLnwjO2qkDsJ6/tQY="),
+        ];
+        let conn = open_conn().unwrap();
+        for (precision, expected) in bigquery_sketches {
+            let actual: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT to_base64(floci_hll_init(value, {precision})) \
+                         FROM (SELECT * FROM (VALUES (1), (2), (3)) AS rows(value))"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "precision {precision}");
+        }
+    }
+
+    #[test]
+    fn test_hll_and_net_rejections_quote_bigquery() {
+        let conn = open_conn().unwrap();
+        let message = |sql: &str| {
+            conn.query_row(sql, [], |_| Ok(()))
+                .expect_err(sql)
+                .to_string()
+        };
+
+        assert!(
+            message("SELECT floci_hll_init(value, 9) FROM (VALUES (1)) AS input(value)")
+                .contains("Argument 2 to HLL_COUNT.INIT must be between 10 and 24"),
+        );
+        assert!(
+            message("SELECT floci_hll_init(value, 25) FROM (VALUES (1)) AS input(value)")
+                .contains("Argument 2 to HLL_COUNT.INIT must be between 10 and 24"),
+        );
+        // NUMERIC/BIGNUMERIC match no overload, so DuckDB reports the call as a binder failure.
+        assert!(
+            message(
+                "SELECT floci_hll_init(value, 15) FROM (VALUES (CAST(1.5 AS DECIMAL(10, 4)))) AS input(value)"
+            )
+            .contains("No function matches the given name and argument types 'floci_hll_init"),
+        );
+        assert!(
+            message("SELECT ip_from_string('nope')")
+                .contains("NET.IP_FROM_STRING() encountered an unparseable IP-address: nope")
+        );
+        assert!(message("SELECT ip_to_string(FROM_HEX('010203'))").contains(
+            "NET.IP_TO_STRING() encountered an invalid IP address. Expected 4 (for IPv4) or 16 (for IPv6) bytes but got 3"
+        ));
+        assert!(message("SELECT ip_trunc(FROM_HEX('010203'), 8::BIGINT)").contains(
+            "The first argument of NET.IP_TRUNC() must have length 4 (for IPv4) or 16 (for IPv6); got 3"
+        ));
+        assert!(
+            message("SELECT ip_trunc(ip_from_string('10.0.0.1'), 33::BIGINT)").contains(
+                "The second argument of NET.IP_TRUNC() must be between 0 and 8 * LENGTH(first argument); got 33"
+            ),
+        );
+        assert!(
+            message("SELECT ip_trunc(ip_from_string('10.0.0.1'), -1::BIGINT)").contains(
+                "The second argument of NET.IP_TRUNC() must be between 0 and 8 * LENGTH(first argument); got -1"
+            ),
+        );
     }
 
     #[test]
@@ -2155,20 +2540,35 @@ mod tests {
     }
 
     #[test]
+    fn test_hll_init_streams_the_group_instead_of_materialising_it() {
+        let conn = open_conn().unwrap();
+        // Ten million BIGINTs are 80 MB before the list around them is counted, which does not fit
+        // in the 64 MB limit: collecting the group the way the previous scalar over `list(...)`
+        // had to fails there. The aggregate keeps only the sketch, so the query stays within it.
+        conn.execute_batch("SET memory_limit = '64MB';").unwrap();
+        let estimate: i64 = conn
+            .query_row(
+                "SELECT floci_hll_extract(floci_hll_init(value)) FROM range(10000000) AS values(value)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(estimate > 9_000_000, "estimate was {estimate}");
+    }
+
+    #[test]
     fn test_hll_functions_compose_through_an_aggregate_cte() {
         let conn = open_conn().unwrap();
         let (extracted, merged): (i64, i64) = conn
             .query_row(
                 "WITH users(name) AS (VALUES ('ana'), ('bo'), ('cyd')),
                  sketches AS (
-                   SELECT floci_hll_init(
-                     list_filter(list(DISTINCT name), value -> value IS NOT NULL), 20
-                   ) AS sketch
-                   FROM users
+                   SELECT floci_hll_init(DISTINCT name, 20) AS sketch FROM users GROUP BY ()
                  )
                  SELECT floci_hll_extract(sketch),
-                   (SELECT floci_hll_merge(list(value))
-                    FROM UNNEST([sketch, sketch]) AS values(value))
+                   (SELECT floci_hll_merge(value)
+                    FROM (SELECT sketch AS value UNION ALL SELECT sketch) AS values)
                  FROM sketches",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2185,10 +2585,9 @@ mod tests {
         let (all_null, no_rows): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
             .query_row(
                 "SELECT
-                   floci_hll_init(list_filter(list(value), value -> value IS NOT NULL), 15),
-                   (SELECT floci_hll_init(list_filter(list(value), value -> value IS NOT NULL), 15)
-                    FROM (SELECT 'never' AS value WHERE FALSE))
-                 FROM (VALUES (CAST(NULL AS VARCHAR))) AS inputs(value)",
+                   (SELECT floci_hll_init(value, 15) FROM (VALUES (CAST(NULL AS VARCHAR))) AS input(value)),
+                   (SELECT floci_hll_init(value, 15)
+                    FROM (SELECT 'never' AS value WHERE FALSE) AS input(value))",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2239,7 +2638,7 @@ mod tests {
     #[test]
     fn test_floci_to_json_string_honors_pretty_print_and_propagates_nulls() {
         let conn = open_conn().unwrap();
-        let (null_value, pretty, null_pretty): (Option<String>, String, Option<String>) = conn
+        let (null_value, pretty, null_pretty): (String, String, Option<String>) = conn
             .query_row(
                 "SELECT
                    floci_to_json_string(CAST(NULL AS VARCHAR)),
@@ -2250,7 +2649,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(null_value, None);
+        assert_eq!(null_value, "null");
         assert_eq!(
             pretty,
             "{\n  \"id\": 1,\n  \"coordinates\": [\n    10,\n    20\n  ]\n}"
@@ -2266,7 +2665,7 @@ mod tests {
             String,
             String,
             String,
-            Option<String>,
+            String,
             String,
             String,
         ) = conn
@@ -2308,9 +2707,35 @@ mod tests {
             r#"{"at":"2024-01-02T03:04:05.123456Z","local_at":"2024-01-03T04:05:06","events":["2024-01-03T04:05:06Z",null]}"#
         );
         assert_eq!(ordinary_string, "\"2024-01-02 03:04:05+00\"");
-        assert_eq!(null, None);
-        assert_eq!(decimal, "123.45");
-        assert_eq!(negative_decimal, "-0.0012");
+        assert_eq!(null, "null");
+        assert_eq!(decimal, "\"123.45\"");
+        assert_eq!(negative_decimal, "\"-0.0012\"");
+    }
+
+    #[test]
+    fn test_floci_to_json_string_quotes_fractional_decimals_like_bigquery() {
+        let conn = open_conn().unwrap();
+        // BigQuery serializes a NUMERIC/BIGNUMERIC as a JSON string when it has a fractional
+        // part and as a JSON number when the value is integral, dropping the trailing zeros.
+        let (fractional, integral, negative, nested): (String, String, String, String) = conn
+            .query_row(
+                "SELECT
+                    floci_to_json_string(CAST('1.500' AS DECIMAL(10, 4))),
+                    floci_to_json_string(CAST('10.00' AS DECIMAL(10, 4))),
+                    floci_to_json_string(CAST('-0.500' AS DECIMAL(10, 4))),
+                    floci_to_json_string([
+                        CAST('1.50' AS DECIMAL(10, 4)),
+                        CAST('2.0' AS DECIMAL(10, 4))
+                    ])",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(fractional, "\"1.5\"");
+        assert_eq!(integral, "10");
+        assert_eq!(negative, "\"-0.5\"");
+        assert_eq!(nested, "[\"1.5\",2]");
     }
 
     #[test]
