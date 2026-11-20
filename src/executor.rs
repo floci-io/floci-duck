@@ -463,6 +463,15 @@ impl VScalar for FlociHllMergePartial {
     }
 }
 
+/// BigQuery's HLL++ sketches keep the sparse precision five bits wider than the normal one, but
+/// the serialized proto caps it at 25 ("Accepted values are in the range [p, 25]"). Asking the
+/// sketch library for the default `normal + 5` therefore fails for BigQuery's precisions 21-24,
+/// so the sparse precision is clamped to the maximum instead.
+fn hll_sparse_precision(normal_precision: i32) -> i32 {
+    (normal_precision + HyperLogLogPlusPlus::DEFAULT_SPARSE_PRECISION_DELTA)
+        .min(HyperLogLogPlusPlus::MAXIMUM_SPARSE_PRECISION)
+}
+
 fn hll_init_list(
     vector: duckdb::ffi::duckdb_vector,
     logical_type: duckdb::ffi::duckdb_logical_type,
@@ -486,55 +495,71 @@ fn hll_init_list(
     let mut child_type = unsafe { ffi::duckdb_list_type_child_type(logical_type) };
     let child_type_id = LogicalTypeId::from(unsafe { ffi::duckdb_get_type_id(child_type) });
 
-    let result =
-        (|| {
-            let builder = HyperLogLogPlusPlus::builder().normal_precision(precision);
-            let mut sketch = match child_type_id {
-                LogicalTypeId::Varchar => builder.build_for_string()?,
-                LogicalTypeId::Blob => builder.build_for_bytes()?,
-                LogicalTypeId::Tinyint
-                | LogicalTypeId::Smallint
-                | LogicalTypeId::Integer
-                | LogicalTypeId::Bigint => builder.build_for_u64()?,
-                other => return Err(format!("HLL_COUNT.INIT does not support {other:?}").into()),
-            };
-
-            for child_index in entry.offset..entry.offset + entry.length {
-                let child_index = child_index as usize;
-                if raw_vector_is_null(child_vector, child_index) {
-                    continue;
-                }
-                match child_type_id {
-                    LogicalTypeId::Varchar => {
-                        let mut value = unsafe {
-                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
-                        };
-                        sketch.add_string(DuckString::new(&mut value).as_str().as_ref())?;
-                    }
-                    LogicalTypeId::Blob => {
-                        let mut value = unsafe {
-                            raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
-                        };
-                        sketch.add_bytes(DuckString::new(&mut value).as_bytes())?;
-                    }
-                    LogicalTypeId::Tinyint => {
-                        sketch.add_i64(
-                            unsafe { raw_vector_value::<i8>(child_vector, child_index) } as i64,
-                        )?
-                    }
-                    LogicalTypeId::Smallint => sketch.add_i64(unsafe {
-                        raw_vector_value::<i16>(child_vector, child_index)
-                    } as i64)?,
-                    LogicalTypeId::Integer => sketch.add_i64(unsafe {
-                        raw_vector_value::<i32>(child_vector, child_index)
-                    } as i64)?,
-                    LogicalTypeId::Bigint => sketch
-                        .add_i64(unsafe { raw_vector_value::<i64>(child_vector, child_index) })?,
-                    _ => unreachable!(),
-                }
+    let result = (|| {
+        if !(HyperLogLogPlusPlus::MINIMUM_PRECISION..=HyperLogLogPlusPlus::MAXIMUM_PRECISION)
+            .contains(&precision)
+        {
+            return Err(format!(
+                "Argument 2 to HLL_COUNT.INIT must be between {} and {}",
+                HyperLogLogPlusPlus::MINIMUM_PRECISION,
+                HyperLogLogPlusPlus::MAXIMUM_PRECISION
+            )
+            .into());
+        }
+        let builder = HyperLogLogPlusPlus::builder()
+            .normal_precision(precision)
+            .sparse_precision(hll_sparse_precision(precision));
+        let mut sketch = match child_type_id {
+            LogicalTypeId::Varchar => builder.build_for_string()?,
+            LogicalTypeId::Blob => builder.build_for_bytes()?,
+            LogicalTypeId::Tinyint
+            | LogicalTypeId::Smallint
+            | LogicalTypeId::Integer
+            | LogicalTypeId::Bigint => builder.build_for_u64()?,
+            LogicalTypeId::Decimal => {
+                return Err("HLL_COUNT.INIT does not support NUMERIC or BIGNUMERIC values".into());
             }
-            Ok(Some(sketch.serialize_to_bytes()?))
-        })();
+            other => return Err(format!("HLL_COUNT.INIT does not support {other:?}").into()),
+        };
+
+        for child_index in entry.offset..entry.offset + entry.length {
+            let child_index = child_index as usize;
+            if raw_vector_is_null(child_vector, child_index) {
+                continue;
+            }
+            match child_type_id {
+                LogicalTypeId::Varchar => {
+                    let mut value = unsafe {
+                        raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
+                    };
+                    sketch.add_string(DuckString::new(&mut value).as_str().as_ref())?;
+                }
+                LogicalTypeId::Blob => {
+                    let mut value = unsafe {
+                        raw_vector_value::<ffi::duckdb_string_t>(child_vector, child_index)
+                    };
+                    sketch.add_bytes(DuckString::new(&mut value).as_bytes())?;
+                }
+                LogicalTypeId::Tinyint => sketch
+                    .add_i64(unsafe { raw_vector_value::<i8>(child_vector, child_index) } as i64)?,
+                LogicalTypeId::Smallint => {
+                    sketch.add_i64(
+                        unsafe { raw_vector_value::<i16>(child_vector, child_index) } as i64,
+                    )?
+                }
+                LogicalTypeId::Integer => {
+                    sketch.add_i64(
+                        unsafe { raw_vector_value::<i32>(child_vector, child_index) } as i64,
+                    )?
+                }
+                LogicalTypeId::Bigint => {
+                    sketch.add_i64(unsafe { raw_vector_value::<i64>(child_vector, child_index) })?
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(Some(sketch.serialize_to_bytes()?))
+    })();
     unsafe {
         ffi::duckdb_destroy_logical_type(&mut child_type);
     }
@@ -655,7 +680,13 @@ impl VScalar for IpToString {
             let address = match bytes.len() {
                 4 => IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(bytes)?)),
                 16 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(bytes)?)),
-                _ => return Err("NET.IP_TO_STRING requires a 4-byte or 16-byte address".into()),
+                _ => {
+                    return Err(format!(
+                        "NET.IP_TO_STRING() encountered an invalid IP address. Expected 4 (for IPv4) or 16 (for IPv6) bytes but got {}",
+                        bytes.len()
+                    )
+                    .into());
+                }
             };
             output.insert(index, address.to_string().as_str());
         }
@@ -693,9 +724,10 @@ impl VScalar for IpFromString {
             }
 
             let mut input_value = *input_value;
-            let address = DuckString::new(&mut input_value)
-                .as_str()
-                .parse::<IpAddr>()?;
+            let text = DuckString::new(&mut input_value).as_str().into_owned();
+            let address = text.parse::<IpAddr>().map_err(|_| {
+                format!("NET.IP_FROM_STRING() encountered an unparseable IP-address: {text}")
+            })?;
             match address {
                 IpAddr::V4(address) => output_vector.insert(index, address.octets().as_slice()),
                 IpAddr::V6(address) => output_vector.insert(index, address.octets().as_slice()),
@@ -778,12 +810,16 @@ impl VScalar for IpTrunc {
             let maximum_bits = match bytes.len() {
                 4 => 32,
                 16 => 128,
-                _ => return Err("NET.IP_TRUNC requires a 4-byte or 16-byte address".into()),
+                length => {
+                    return Err(format!(
+                        "The first argument of NET.IP_TRUNC() must have length 4 (for IPv4) or 16 (for IPv6); got {length}"
+                    )
+                    .into());
+                }
             };
             if prefix < 0 || prefix > maximum_bits {
                 return Err(format!(
-                    "NET.IP_TRUNC prefix length {prefix} is invalid for a {}-byte address",
-                    bytes.len()
+                    "The second argument of NET.IP_TRUNC() must be between 0 and 8 * LENGTH(first argument); got {prefix}"
                 )
                 .into());
             }
@@ -1081,7 +1117,7 @@ fn raw_decimal_to_json(
 
     let negative = raw < 0;
     let digits = raw.unsigned_abs().to_string();
-    let number = if scale == 0 {
+    let mut number = if scale == 0 {
         digits
     } else if digits.len() <= scale {
         format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
@@ -1089,12 +1125,26 @@ fn raw_decimal_to_json(
         let split = digits.len() - scale;
         format!("{}.{}", &digits[..split], &digits[split..])
     };
-    let json_number = if negative {
+    // BigQuery drops the trailing zeros of the scale: NUMERIC '1.50' serializes as 1.5.
+    if number.contains('.') {
+        number = number
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+    }
+    let canonical = if negative && number != "0" {
         format!("-{number}")
     } else {
         number
     };
-    Ok(serde_json::from_str(&json_number)?)
+    // BigQuery serializes a NUMERIC/BIGNUMERIC with a fractional part as a JSON string and an
+    // integral one as a JSON number, so `TO_JSON_STRING(NUMERIC '1.5')` is "\"1.5\"" while
+    // `TO_JSON_STRING(NUMERIC '1.0')` is `1`.
+    if canonical.contains('.') {
+        Ok(serde_json::Value::String(canonical))
+    } else {
+        Ok(serde_json::from_str(&canonical)?)
+    }
 }
 
 fn float_to_json(value: f64) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -2122,6 +2172,84 @@ mod tests {
     }
 
     #[test]
+    fn test_hll_init_precisions_reproduce_bigquery_sketch_bytes() {
+        // Sketches of UNNEST([1, 2, 3]) produced by live BigQuery's HLL_COUNT.INIT(x, p) for
+        // every precision it accepts. The sparse precision is capped at 25, so precisions
+        // 21-24 would otherwise ask the sketch library for `normal + 5` and fail.
+        let bigquery_sketches = [
+            (10, "CHAQAxgCIAiCBw8QAxgKIA8yB/GDAdMcyBg="),
+            (11, "CHAQAxgCIAiCBw8QAxgLIBAyB+KHAqY5kTE="),
+            (12, "CHAQAxgCIAiCBw8QAxgMIBEyB8WPBMtyomI="),
+            (13, "CHAQAxgCIAiCBxEQAxgNIBIyCYufCNqpA96/KA=="),
+            (14, "CHAQAxgCIAiCBxEQAxgOIBMyCZa+ELXTBrf/UA=="),
+            (15, "CHAQAxgCIAiCBxIQAxgPIBQyCqz8IOqmDev+oQE="),
+            (16, "CHAQAxgCIAiCBxEQAxgQIBUyCdj4QampDqykDA=="),
+            (17, "CHAQAxgCIAiCBxIQAxgRIBYyCrDxgwHS0hzYyBg="),
+            (18, "CHAQAxgCIAiCBxMQAxgSIBcyC4SIwQKwkTGNrJ0J"),
+            (19, "CHAQAxgCIAiCBxIQAxgTIBgyCsHFjwTHynLgomI="),
+            (20, "CHAQAxgCIAiCBxQQAxgUIBkyDIOLnwiNleUBwcXEAQ=="),
+            (21, "CHAQAxgCIAiCBxQQAxgVIBkyDIOLnwjO2qkD8JrIXA=="),
+            (22, "CHAQAxgCIAiCBxUQAxgWIBkyDYOLnwjO2qkDsJvZxAE="),
+            (23, "CHAQAxgCIAiCBxUQAxgXIBkyDYOLnwjO2qkDsJz7lAM="),
+            (24, "CHAQAxgCIAiCBxUQAxgYIBkyDYOLnwjO2qkDsJ6/tQY="),
+        ];
+        let conn = open_conn().unwrap();
+        for (precision, expected) in bigquery_sketches {
+            let actual: String = conn
+                .query_row(
+                    &format!("SELECT to_base64(floci_hll_init([1, 2, 3], {precision}))"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "precision {precision}");
+        }
+    }
+
+    #[test]
+    fn test_hll_and_net_rejections_quote_bigquery() {
+        let conn = open_conn().unwrap();
+        let message = |sql: &str| {
+            conn.query_row(sql, [], |_| Ok(()))
+                .expect_err(sql)
+                .to_string()
+        };
+
+        assert!(
+            message("SELECT floci_hll_init([1], 9)")
+                .contains("Argument 2 to HLL_COUNT.INIT must be between 10 and 24"),
+        );
+        assert!(
+            message("SELECT floci_hll_init([1], 25)")
+                .contains("Argument 2 to HLL_COUNT.INIT must be between 10 and 24"),
+        );
+        assert!(
+            message("SELECT floci_hll_init([CAST(1.5 AS DECIMAL(10, 4))], 15)")
+                .contains("HLL_COUNT.INIT does not support NUMERIC or BIGNUMERIC values"),
+        );
+        assert!(
+            message("SELECT ip_from_string('nope')")
+                .contains("NET.IP_FROM_STRING() encountered an unparseable IP-address: nope")
+        );
+        assert!(message("SELECT ip_to_string(FROM_HEX('010203'))").contains(
+            "NET.IP_TO_STRING() encountered an invalid IP address. Expected 4 (for IPv4) or 16 (for IPv6) bytes but got 3"
+        ));
+        assert!(message("SELECT ip_trunc(FROM_HEX('010203'), 8::BIGINT)").contains(
+            "The first argument of NET.IP_TRUNC() must have length 4 (for IPv4) or 16 (for IPv6); got 3"
+        ));
+        assert!(
+            message("SELECT ip_trunc(ip_from_string('10.0.0.1'), 33::BIGINT)").contains(
+                "The second argument of NET.IP_TRUNC() must be between 0 and 8 * LENGTH(first argument); got 33"
+            ),
+        );
+        assert!(
+            message("SELECT ip_trunc(ip_from_string('10.0.0.1'), -1::BIGINT)").contains(
+                "The second argument of NET.IP_TRUNC() must be between 0 and 8 * LENGTH(first argument); got -1"
+            ),
+        );
+    }
+
+    #[test]
     fn test_length_functions_distinguish_characters_from_bytes() {
         let conn = open_conn().unwrap();
         let lengths: (i64, i64, i64, i64, i64, i64, i64, i64) = conn
@@ -2309,8 +2437,34 @@ mod tests {
         );
         assert_eq!(ordinary_string, "\"2024-01-02 03:04:05+00\"");
         assert_eq!(null, None);
-        assert_eq!(decimal, "123.45");
-        assert_eq!(negative_decimal, "-0.0012");
+        assert_eq!(decimal, "\"123.45\"");
+        assert_eq!(negative_decimal, "\"-0.0012\"");
+    }
+
+    #[test]
+    fn test_floci_to_json_string_quotes_fractional_decimals_like_bigquery() {
+        let conn = open_conn().unwrap();
+        // BigQuery serializes a NUMERIC/BIGNUMERIC as a JSON string when it has a fractional
+        // part and as a JSON number when the value is integral, dropping the trailing zeros.
+        let (fractional, integral, negative, nested): (String, String, String, String) = conn
+            .query_row(
+                "SELECT
+                    floci_to_json_string(CAST('1.500' AS DECIMAL(10, 4))),
+                    floci_to_json_string(CAST('10.00' AS DECIMAL(10, 4))),
+                    floci_to_json_string(CAST('-0.500' AS DECIMAL(10, 4))),
+                    floci_to_json_string([
+                        CAST('1.50' AS DECIMAL(10, 4)),
+                        CAST('2.0' AS DECIMAL(10, 4))
+                    ])",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(fractional, "\"1.5\"");
+        assert_eq!(integral, "10");
+        assert_eq!(negative, "\"-0.5\"");
+        assert_eq!(nested, "[\"1.5\",2]");
     }
 
     #[test]
