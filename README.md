@@ -82,7 +82,7 @@ directly.
 | `floci_hll_extract(sketch)` | Returns the approximate cardinality of an HLL++ sketch; `NULL` returns `0`. |
 | `floci_hll_merge(sketch)`, `floci_hll_merge_partial(sketch)` | Aggregates that merge the HLL++ `BLOB` of each row as it arrives, returning the estimate or a serialized merged sketch. A group with no sketch yields `0` and `NULL`, respectively. |
 | `json_extract_array(input[, path])` | Returns a list suitable for `UNNEST`; a `VARCHAR` input returns `VARCHAR[]` and a `JSON` input returns `JSON[]`. The default path is `$`. |
-| `floci_to_json_string(value[, pretty_print])` | Serializes scalars and nested DuckDB values to JSON. `TIMESTAMPTZ` values are UTC ISO-8601 strings; `TIMESTAMP` values have no offset; `DECIMAL` values follow BigQuery, as a JSON string with the trailing zeros dropped when the value has a fractional part and as a JSON number when it is integral. `NULL` input (or `NULL` `pretty_print`) returns `NULL`. |
+| `floci_to_json_string(value[, pretty_print])` | Serializes scalars and nested DuckDB values to JSON. `TIMESTAMPTZ` values are UTC ISO-8601 strings; `TIMESTAMP` values have no offset; `DECIMAL` values follow BigQuery, as a JSON string with the trailing zeros dropped when the value has a fractional part and as a JSON number when it is integral. A `NULL` value serializes as the JSON text `null`; a `NULL` `pretty_print` returns `NULL`. |
 
 For example:
 
