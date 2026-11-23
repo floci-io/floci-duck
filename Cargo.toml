@@ -14,7 +14,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 anyhow = "1.0.103"
 base64 = "0.22.1"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
-farmhash2 = "1.1.5"
+# Pinned exactly: this fork carries one upstream fix (seiflotfy/rust-farmhash#16) and has a
+# single release, so a later one must not arrive silently through `cargo update`.
+farmhash2 = "=1.1.5"
 # Generates its protobuf bindings at build time, so `protoc` must be on PATH.
 zetasketch-rs = "0.1.3"
 # Arrow IPC framing for /query responses (duckdb-rs builds arrow without the ipc feature).

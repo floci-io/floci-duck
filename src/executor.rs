@@ -2100,9 +2100,12 @@ mod tests {
 
     #[test]
     fn test_farm_fingerprint_hashes_inputs_longer_than_64_bytes() {
-        // Reference values from Google's farmhash Hash64 for 128 bytes: a length that is
-        // both >64 and a multiple of 64, where the `farmhash` crate loops one time too
-        // many. `farmhash2` carries that fix.
+        // 5868382771906808855 (0x5170af09fd870c17) is what live BigQuery answers for both
+        // FARM_FINGERPRINT(REPEAT('x', 128)) and its BYTES form, and what Google's reference
+        // implementation returns for the same 128 bytes: `Fingerprint64`, the alias of
+        // `farmhashna::Hash64`, whose loop runs `(len - 1) / 64` times. 128 is both >64 and a
+        // multiple of 64, the length where the `farmhash` crate loops one time too many;
+        // `farmhash2` carries that one-line fix (seiflotfy/rust-farmhash#16).
         let conn = open_conn().unwrap();
         let (long_string, long_bytes): (i64, i64) = conn
             .query_row(
