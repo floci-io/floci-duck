@@ -1,3 +1,10 @@
+## [0.4.2](https://github.com/floci-io/floci-duck/compare/0.4.1...0.4.2) (2026-11-23)
+
+
+### Bug Fixes
+
+* **query:** hash FARM_FINGERPRINT inputs with farmhash2 ([#12](https://github.com/floci-io/floci-duck/issues/12)) ([62b7034](https://github.com/floci-io/floci-duck/commit/62b703430964d26fda8f4f30489ccc339e32847c)), closes [seiflotfy/rust-farmhash#16](https://github.com/seiflotfy/rust-farmhash/issues/16)
+
 ## [0.4.1](https://github.com/floci-io/floci-duck/compare/0.4.0...0.4.1) (2026-11-03)
 
 
