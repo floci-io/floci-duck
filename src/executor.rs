@@ -569,7 +569,7 @@ unsafe extern "C" fn hll_merge_update(
 }
 
 unsafe extern "C" fn hll_combine(
-    _info: duckdb::ffi::duckdb_function_info,
+    info: duckdb::ffi::duckdb_function_info,
     source: *mut duckdb::ffi::duckdb_aggregate_state,
     target: *mut duckdb::ffi::duckdb_aggregate_state,
     count: duckdb::ffi::idx_t,
@@ -581,17 +581,29 @@ unsafe extern "C" fn hll_combine(
         if target.failed {
             continue;
         }
-        match &mut target.sketch {
+        // A source state that failed already reported the error that fails the query, so the
+        // sketch it stopped updating is not merged into this one.
+        if source.failed {
+            target.failed = true;
+            continue;
+        }
+        let error = match &mut target.sketch {
             // The source state keeps its own sketch and is destroyed by DuckDB afterwards.
-            Some(current) => {
-                if let Some(sketch) = source.sketch.clone() {
-                    let _ = current.merge_aggregator(sketch);
-                }
-            }
+            Some(current) => source
+                .sketch
+                .clone()
+                .and_then(|sketch| current.merge_aggregator(sketch).err()),
             None => {
                 target.sketch = source.sketch.clone();
                 target.precision = source.precision;
+                None
             }
+        };
+        // Sketches of incompatible types cannot be merged into one estimate; report it the way
+        // update does instead of answering a count that leaves the source out.
+        if let Some(error) = error {
+            unsafe { set_hll_error(info, &error.to_string()) };
+            target.failed = true;
         }
     }
 }
@@ -664,6 +676,26 @@ unsafe extern "C" fn hll_merge_partial_finalize(
     }
 }
 
+/// An owned C API handle, freed with its `destroy` function when it goes out of scope. DuckDB
+/// copies a function into the set it is added to and the set into the catalog, so the handles
+/// created here stay the caller's to destroy, and no return path may leak them.
+struct OwnedHandle<T> {
+    handle: T,
+    destroy: unsafe extern "C" fn(*mut T),
+}
+
+impl<T> OwnedHandle<T> {
+    unsafe fn new(handle: T, destroy: unsafe extern "C" fn(*mut T)) -> Self {
+        Self { handle, destroy }
+    }
+}
+
+impl<T> Drop for OwnedHandle<T> {
+    fn drop(&mut self) {
+        unsafe { (self.destroy)(&mut self.handle) };
+    }
+}
+
 /// Registers the HLL++ aggregates on `database`. Function registration is database-scoped, so a
 /// throwaway connection registers them for the connection the crate hands back.
 fn register_sidecar_functions(database: duckdb::ffi::duckdb_database) -> anyhow::Result<()> {
@@ -674,8 +706,12 @@ fn register_sidecar_functions(database: duckdb::ffi::duckdb_database) -> anyhow:
         if ffi::duckdb_connect(database, &mut registrar) != ffi::DuckDBSuccess {
             anyhow::bail!("could not open a connection to register the HLL aggregate functions");
         }
+        let registrar = OwnedHandle::new(registrar, ffi::duckdb_disconnect);
 
-        let init_set = ffi::duckdb_create_aggregate_function_set(c"floci_hll_init".as_ptr());
+        let init_set = OwnedHandle::new(
+            ffi::duckdb_create_aggregate_function_set(c"floci_hll_init".as_ptr()),
+            ffi::duckdb_destroy_aggregate_function_set,
+        );
         // A DECIMAL argument matches none of these overloads and DuckDB answers with the binder
         // error for the call, which is how NUMERIC/BIGNUMERIC initialization is refused.
         for value_type in [
@@ -683,68 +719,99 @@ fn register_sidecar_functions(database: duckdb::ffi::duckdb_database) -> anyhow:
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
         ] {
-            let function = hll_aggregate_function(
-                c"floci_hll_init",
-                &[value_type, ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER],
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
-                Some(hll_init_update),
-                Some(hll_init_finalize),
+            let function = OwnedHandle::new(
+                hll_aggregate_function(
+                    c"floci_hll_init",
+                    &[value_type, ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER],
+                    ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+                    Some(hll_init_update),
+                    Some(hll_init_finalize),
+                ),
+                ffi::duckdb_destroy_aggregate_function,
             );
-            if ffi::duckdb_add_aggregate_function_to_set(init_set, function) != ffi::DuckDBSuccess {
+            if ffi::duckdb_add_aggregate_function_to_set(init_set.handle, function.handle)
+                != ffi::DuckDBSuccess
+            {
                 anyhow::bail!("could not add the floci_hll_init overload for {value_type}");
             }
-            let default_function = hll_aggregate_function(
-                c"floci_hll_init",
-                &[value_type],
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
-                Some(hll_init_default_update),
-                Some(hll_init_finalize),
+            let default_function = OwnedHandle::new(
+                hll_aggregate_function(
+                    c"floci_hll_init",
+                    &[value_type],
+                    ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+                    Some(hll_init_default_update),
+                    Some(hll_init_finalize),
+                ),
+                ffi::duckdb_destroy_aggregate_function,
             );
-            if ffi::duckdb_add_aggregate_function_to_set(init_set, default_function)
+            if ffi::duckdb_add_aggregate_function_to_set(init_set.handle, default_function.handle)
                 != ffi::DuckDBSuccess
             {
                 anyhow::bail!("could not add the floci_hll_init(value) overload for {value_type}");
             }
         }
-        if ffi::duckdb_register_aggregate_function_set(registrar, init_set) != ffi::DuckDBSuccess {
+        if ffi::duckdb_register_aggregate_function_set(registrar.handle, init_set.handle)
+            != ffi::DuckDBSuccess
+        {
             anyhow::bail!("could not register floci_hll_init");
         }
 
-        let merge_set = ffi::duckdb_create_aggregate_function_set(c"floci_hll_merge".as_ptr());
-        let merge = hll_aggregate_function(
-            c"floci_hll_merge",
-            &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB],
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
-            Some(hll_merge_update),
-            Some(hll_merge_finalize),
+        let merge_set = OwnedHandle::new(
+            ffi::duckdb_create_aggregate_function_set(c"floci_hll_merge".as_ptr()),
+            ffi::duckdb_destroy_aggregate_function_set,
         );
-        if ffi::duckdb_add_aggregate_function_to_set(merge_set, merge) != ffi::DuckDBSuccess {
+        let merge = OwnedHandle::new(
+            hll_aggregate_function(
+                c"floci_hll_merge",
+                &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB],
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+                Some(hll_merge_update),
+                Some(hll_merge_finalize),
+            ),
+            ffi::duckdb_destroy_aggregate_function,
+        );
+        if ffi::duckdb_add_aggregate_function_to_set(merge_set.handle, merge.handle)
+            != ffi::DuckDBSuccess
+        {
             anyhow::bail!("could not add the floci_hll_merge overload");
         }
-        if ffi::duckdb_register_aggregate_function_set(registrar, merge_set) != ffi::DuckDBSuccess {
+        if ffi::duckdb_register_aggregate_function_set(registrar.handle, merge_set.handle)
+            != ffi::DuckDBSuccess
+        {
             anyhow::bail!("could not register floci_hll_merge");
         }
 
-        let partial_set =
-            ffi::duckdb_create_aggregate_function_set(c"floci_hll_merge_partial".as_ptr());
-        let partial = hll_aggregate_function(
-            c"floci_hll_merge_partial",
-            &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB],
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
-            Some(hll_merge_update),
-            Some(hll_merge_partial_finalize),
+        let partial_set = OwnedHandle::new(
+            ffi::duckdb_create_aggregate_function_set(c"floci_hll_merge_partial".as_ptr()),
+            ffi::duckdb_destroy_aggregate_function_set,
         );
-        if ffi::duckdb_add_aggregate_function_to_set(partial_set, partial) != ffi::DuckDBSuccess {
+        let partial = OwnedHandle::new(
+            hll_aggregate_function(
+                c"floci_hll_merge_partial",
+                &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB],
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB,
+                Some(hll_merge_update),
+                Some(hll_merge_partial_finalize),
+            ),
+            ffi::duckdb_destroy_aggregate_function,
+        );
+        if ffi::duckdb_add_aggregate_function_to_set(partial_set.handle, partial.handle)
+            != ffi::DuckDBSuccess
+        {
             anyhow::bail!("could not add the floci_hll_merge_partial overload");
         }
-        if ffi::duckdb_register_aggregate_function_set(registrar, partial_set) != ffi::DuckDBSuccess
+        if ffi::duckdb_register_aggregate_function_set(registrar.handle, partial_set.handle)
+            != ffi::DuckDBSuccess
         {
             anyhow::bail!("could not register floci_hll_merge_partial");
         }
 
         // floci_to_json_string needs special NULL handling so a NULL value serializes as the JSON text
         // null; the crate's scalar registration cannot request that, so it is registered here.
-        let json_set = ffi::duckdb_create_scalar_function_set(c"floci_to_json_string".as_ptr());
+        let json_set = OwnedHandle::new(
+            ffi::duckdb_create_scalar_function_set(c"floci_to_json_string".as_ptr()),
+            ffi::duckdb_destroy_scalar_function_set,
+        );
         for parameters in [
             vec![ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
             vec![
@@ -752,16 +819,21 @@ fn register_sidecar_functions(database: duckdb::ffi::duckdb_database) -> anyhow:
                 ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
             ],
         ] {
-            let function = json_scalar_function(&parameters)?;
-            if ffi::duckdb_add_scalar_function_to_set(json_set, function) != ffi::DuckDBSuccess {
+            let function = OwnedHandle::new(
+                json_scalar_function(&parameters)?,
+                ffi::duckdb_destroy_scalar_function,
+            );
+            if ffi::duckdb_add_scalar_function_to_set(json_set.handle, function.handle)
+                != ffi::DuckDBSuccess
+            {
                 anyhow::bail!("could not add a floci_to_json_string overload");
             }
         }
-        if ffi::duckdb_register_scalar_function_set(registrar, json_set) != ffi::DuckDBSuccess {
+        if ffi::duckdb_register_scalar_function_set(registrar.handle, json_set.handle)
+            != ffi::DuckDBSuccess
+        {
             anyhow::bail!("could not register floci_to_json_string");
         }
-
-        ffi::duckdb_disconnect(&mut registrar);
     }
     Ok(())
 }
@@ -1357,11 +1429,15 @@ fn raw_decimal_to_json(
     };
     // BigQuery serializes a NUMERIC/BIGNUMERIC with a fractional part as a JSON string and an
     // integral one as a JSON number, so `TO_JSON_STRING(NUMERIC '1.5')` is "\"1.5\"" while
-    // `TO_JSON_STRING(NUMERIC '1.0')` is `1`.
+    // `TO_JSON_STRING(NUMERIC '1.0')` is `1`. A JSON number cannot hold every integral value
+    // exactly either, so an integral one follows the same +-2^53 rule `json_int64` applies to
+    // BIGINT: `TO_JSON_STRING(NUMERIC '9007199254740993')` is "\"9007199254740993\"".
     if canonical.contains('.') {
         Ok(serde_json::Value::String(canonical))
     } else {
-        Ok(serde_json::from_str(&canonical)?)
+        Ok(canonical
+            .parse::<i64>()
+            .map_or_else(|_| serde_json::Value::String(canonical), json_int64))
     }
 }
 
@@ -2637,6 +2713,47 @@ mod tests {
     }
 
     #[test]
+    fn test_hll_merge_reports_a_sketch_that_cannot_be_combined() {
+        // Sketches of different value types cannot be merged into one estimate, and BigQuery
+        // raises an error for them. One sketch per file lets a parallel plan build a state of a
+        // single type per scan task, so the mismatch surfaces where the partial states are
+        // combined; that failure used to be dropped and the estimate only counted one file.
+        let dir =
+            std::env::temp_dir().join(format!("floci-duck-hll-combine-{}", std::process::id()));
+        let path = dir.to_str().unwrap().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open_conn().unwrap();
+        conn.execute_batch("SET threads = 4;").unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 0 AS g, floci_hll_init(value) AS sketch FROM range(1000) AS values(value))
+             TO '{path}/integers.parquet' (FORMAT PARQUET);
+             COPY (SELECT 0 AS g, floci_hll_init('tag' || value) AS sketch FROM range(1000) AS values(value))
+             TO '{path}/strings.parquet' (FORMAT PARQUET);"
+        ))
+        .unwrap();
+
+        let message = conn
+            .query_row(
+                &format!(
+                    "SELECT floci_hll_merge(sketch)
+                     FROM read_parquet('{path}/*.parquet')
+                     GROUP BY g"
+                ),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect_err("merging sketches of different types must fail")
+            .to_string();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            message.contains("incompatible with aggregator of type"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn test_floci_to_json_string_uses_canonical_fractional_second_widths() {
         let conn = open_conn().unwrap();
         let (millis, datetime, timestamp): (String, String, String) = conn
@@ -2756,6 +2873,45 @@ mod tests {
         assert_eq!(integral, "10");
         assert_eq!(negative, "\"-0.5\"");
         assert_eq!(nested, "[\"1.5\",2]");
+    }
+
+    #[test]
+    fn test_floci_to_json_string_quotes_integral_decimals_beyond_the_json_number_range() {
+        let conn = open_conn().unwrap();
+        // Live BigQuery answers these for TO_JSON_STRING: a JSON number only holds the integral
+        // values up to 2^53 exactly, so anything beyond it is quoted like a fractional value.
+        let (at_limit, beyond, negative_limit, negative_beyond, huge): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT
+                    floci_to_json_string(CAST('9007199254740992' AS DECIMAL(38, 0))),
+                    floci_to_json_string(CAST('9007199254740993' AS DECIMAL(38, 0))),
+                    floci_to_json_string(CAST('-9007199254740992' AS DECIMAL(38, 0))),
+                    floci_to_json_string(CAST('-9007199254740994' AS DECIMAL(38, 0))),
+                    floci_to_json_string(CAST('99999999999999999999999999999999999999' AS DECIMAL(38, 0)))",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(at_limit, "9007199254740992");
+        assert_eq!(beyond, "\"9007199254740993\"");
+        assert_eq!(negative_limit, "-9007199254740992");
+        assert_eq!(negative_beyond, "\"-9007199254740994\"");
+        assert_eq!(huge, "\"99999999999999999999999999999999999999\"");
     }
 
     #[test]
