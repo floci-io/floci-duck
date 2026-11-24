@@ -73,16 +73,16 @@ directly.
 | `farm_fingerprint(value)` | FarmHash Fingerprint64 for `VARCHAR` or `BLOB`; returns signed `BIGINT`, matching BigQuery `FARM_FINGERPRINT`. |
 | `floci_length(value)` | Character count for `VARCHAR`; byte count for `BLOB`. |
 | `floci_byte_length(value)` | Byte count for `VARCHAR` or `BLOB`. |
-| `ip_from_string(text)`, `safe_ip_from_string(text)` | Parse IPv4 or IPv6 text into a 4- or 16-byte `BLOB`. The `safe_` form returns `NULL` for invalid input; the other form errors. |
-| `ip_to_string(bytes)` | Render a 4- or 16-byte IP `BLOB`; other widths are errors. |
-| `ip_trunc(bytes, prefix_length)` | Zero host bits in a 4- or 16-byte IP `BLOB`; validates the prefix length. |
+| `ip_from_string(text)`, `safe_ip_from_string(text)` | Parse IPv4 or IPv6 text into a 4- or 16-byte `BLOB`. The `safe_` form returns `NULL` for invalid input; the other form errors with BigQuery's `NET.IP_FROM_STRING() encountered an unparseable IP-address: <text>`. |
+| `ip_to_string(bytes)` | Render a 4- or 16-byte IP `BLOB`; other widths are errors quoting BigQuery's message. |
+| `ip_trunc(bytes, prefix_length)` | Zero host bits in a 4- or 16-byte IP `BLOB`; validates the address width and prefix length with BigQuery's messages. |
 | `BLOB << BIGINT`, `BLOB & BLOB` | Fixed-width, big-endian byte shift and bitwise AND. Shifts must be non-negative; AND operands must have equal widths. |
 | `bit_count(BLOB)`, `repeat(BLOB, BIGINT)`, `concat(BLOB, ...)` | Byte-oriented versions of these helpers. `repeat` rejects negative counts; `concat` accepts two through eight `BLOB` arguments. |
-| `floci_hll_init(values, precision)` | Creates a BigQuery-compatible ZetaSketch HLL++ `BLOB` from a `LIST` of `VARCHAR`, `BLOB`, or signed integer values. An empty list produces `NULL`. |
+| `floci_hll_init(value[, precision])` | Aggregate that builds a BigQuery-compatible ZetaSketch HLL++ `BLOB` as rows arrive, over `VARCHAR`, `BLOB` or signed integer values, with BigQuery's precision range of 10 to 24 (the sketch bytes match the ones BigQuery produces for the same input). The precision defaults to 15. An all-`NULL` group produces `NULL`; `DECIMAL` values are rejected. |
 | `floci_hll_extract(sketch)` | Returns the approximate cardinality of an HLL++ sketch; `NULL` returns `0`. |
-| `floci_hll_merge(sketches)`, `floci_hll_merge_partial(sketches)` | Merge a `LIST` of HLL++ `BLOB`s, returning the estimate or a serialized merged sketch. Empty lists yield `0` and `NULL`, respectively. |
+| `floci_hll_merge(sketch)`, `floci_hll_merge_partial(sketch)` | Aggregates that merge the HLL++ `BLOB` of each row as it arrives, returning the estimate or a serialized merged sketch. A group with no sketch yields `0` and `NULL`, respectively, and sketches of incompatible types are rejected rather than merged into a partial answer. |
 | `json_extract_array(input[, path])` | Returns a list suitable for `UNNEST`; a `VARCHAR` input returns `VARCHAR[]` and a `JSON` input returns `JSON[]`. The default path is `$`. |
-| `floci_to_json_string(value[, pretty_print])` | Serializes scalars and nested DuckDB values to JSON. `TIMESTAMPTZ` values are UTC ISO-8601 strings; `TIMESTAMP` values have no offset. `NULL` input (or `NULL` `pretty_print`) returns `NULL`. |
+| `floci_to_json_string(value[, pretty_print])` | Serializes scalars and nested DuckDB values to JSON. `TIMESTAMPTZ` values are UTC ISO-8601 strings; `TIMESTAMP` values have no offset; `DECIMAL` values follow BigQuery, as a JSON string with the trailing zeros dropped when the value has a fractional part and as a JSON number when it is integral, quoted when a JSON number cannot hold it exactly (an absolute value beyond 2^53). A `NULL` value serializes as the JSON text `null`; a `NULL` `pretty_print` returns `NULL`. |
 
 For example:
 
