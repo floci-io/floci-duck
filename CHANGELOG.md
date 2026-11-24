@@ -1,3 +1,10 @@
+## [0.4.3](https://github.com/floci-io/floci-duck/compare/0.4.2...0.4.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* **query:** match BigQuery on HLL precision, decimal JSON and rejections ([#13](https://github.com/floci-io/floci-duck/issues/13)) ([22f1c6b](https://github.com/floci-io/floci-duck/commit/22f1c6bc9728820e97992d3b1a91fb42e1635830))
+
 ## [0.4.2](https://github.com/floci-io/floci-duck/compare/0.4.1...0.4.2) (2026-11-23)
 
 
