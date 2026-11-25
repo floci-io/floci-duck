@@ -397,3 +397,17 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Related Projects
 
 - [Floci](https://github.com/floci-io/floci): The main Floci project.
+
+### Independent optional setup for `/execute`
+
+`setup_sql` remains required: any failure aborts the request. The optional
+`optional_setup_sql` array runs afterward on the same connection, before the final
+SQL. Each array entry is attempted independently, in order; an entry failure is
+logged by index without SQL or error contents. Entries are not split on semicolons.
+Callers should supply one independent object definition per entry. Partial changes
+inside a multi-statement entry are not rolled back.
+
+This opt-in facility supports registering independent catalog objects. A query
+that references an object whose registration failed still fails normally. No
+query error is ignored and no substitute empty table is created. Existing requests
+omit the array and retain their previous behavior. `/query` is unchanged.

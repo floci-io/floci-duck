@@ -12,6 +12,9 @@ pub struct ExecuteRequest {
     pub s3_url_style: Option<String>,
     pub output_s3_path: Option<String>,
     pub setup_sql: Option<String>,
+    /// Independent optional setup statements. Failures do not suppress final SQL errors.
+    #[serde(default)]
+    pub optional_setup_sql: Vec<String>,
     #[allow(dead_code)]
     pub variables: Option<HashMap<String, String>>,
 }

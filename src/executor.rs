@@ -16,7 +16,7 @@ use duckdb::vtab::arrow::WritableVector;
 use std::env;
 use std::ffi::CStr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use tracing::info;
+use tracing::{debug, info};
 use zetasketch_rs::{Aggregator, HyperLogLogPlusPlus};
 
 struct FlociByteLength;
@@ -1750,13 +1750,12 @@ pub fn execute_query(req: ExecuteRequest) -> anyhow::Result<()> {
 
     let variables = req.variables.unwrap_or_default();
 
-    if let Some(setup) = &req.setup_sql {
-        if !setup.trim().is_empty() {
-            info!("Executing setup SQL");
-            let setup_sql = apply_variables(setup, &variables);
-            conn.execute_batch(&setup_sql)?;
-        }
-    }
+    apply_setup(
+        &conn,
+        req.setup_sql.as_deref(),
+        &req.optional_setup_sql,
+        &variables,
+    )?;
 
     let sql = apply_variables(&req.sql, &variables);
 
@@ -1771,6 +1770,32 @@ pub fn execute_query(req: ExecuteRequest) -> anyhow::Result<()> {
     info!("Executing final SQL: {}", final_sql);
     conn.execute_batch(&final_sql)?;
 
+    Ok(())
+}
+
+/// Register independent optional objects without making unrelated objects depend on them.
+/// Required setup and the final user statement retain their normal error propagation.
+fn apply_setup(
+    conn: &Connection,
+    required: Option<&str>,
+    statements: &[String],
+    variables: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    if let Some(required) = required.filter(|sql| !sql.trim().is_empty()) {
+        conn.execute_batch(&apply_variables(required, variables))?;
+    }
+    for (index, statement) in statements.iter().enumerate() {
+        if statement.trim().is_empty() {
+            continue;
+        }
+        if conn
+            .execute_batch(&apply_variables(statement, variables))
+            .is_err()
+        {
+            // Do not log SQL or error text: either can include credentials or data paths.
+            debug!(statement_index = index, "Optional setup statement failed");
+        }
+    }
     Ok(())
 }
 
@@ -2404,6 +2429,7 @@ mod tests {
             s3_url_style: None,
             output_s3_path: Some("s3://bucket/output.csv".to_string()),
             setup_sql: None,
+            optional_setup_sql: Vec::new(),
             variables: None,
         };
 
@@ -3224,5 +3250,127 @@ mod tests {
         assert_eq!(base64_value(b"f"), serde_json::json!("Zg=="));
         assert_eq!(base64_value(b"fo"), serde_json::json!("Zm8="));
         assert_eq!(base64_value(b"foo"), serde_json::json!("Zm9v"));
+    }
+}
+
+#[cfg(test)]
+mod optional_setup_tests {
+    use super::apply_setup;
+    use duckdb::Connection;
+    use std::collections::HashMap;
+
+    #[test]
+    fn unrelated_failed_view_does_not_block_cross_schema_query() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE SCHEMA first_db; CREATE SCHEMA second_db;")
+            .unwrap();
+        let missing =
+            std::env::temp_dir().join(format!("floci-optional-{}.parquet", uuid::Uuid::new_v4()));
+        assert!(!missing.exists());
+        let broken = format!(
+            "CREATE VIEW first_db.broken AS SELECT * FROM read_parquet('{}')",
+            super::escape_sql(&missing.to_string_lossy()),
+        );
+        let definitions = vec![
+            broken,
+            "CREATE VIEW first_db.good AS SELECT 7 AS value".into(),
+            "CREATE VIEW second_db.good AS SELECT 11 AS value".into(),
+        ];
+        // The original single setup batch aborts before registering the good views.
+        assert!(conn.execute_batch(&definitions.join(";\n")).is_err());
+        assert!(conn.prepare("SELECT * FROM first_db.good").is_err());
+        apply_setup(&conn, None, &definitions, &HashMap::new()).unwrap();
+        let total: i64 = conn
+            .query_row(
+                "SELECT a.value + b.value FROM first_db.good a CROSS JOIN second_db.good b",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 18);
+        assert!(conn.prepare("SELECT * FROM first_db.broken").is_err());
+    }
+
+    #[test]
+    fn failed_optional_statement_does_not_hide_final_query_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_setup(&conn, None, &["INVALID SETUP".into()], &HashMap::new()).unwrap();
+        assert!(conn.execute_batch("INVALID FINAL QUERY").is_err());
+    }
+
+    #[test]
+    fn variables_and_quoted_semicolons_remain_one_statement() {
+        let conn = Connection::open_in_memory().unwrap();
+        let variables = HashMap::from([("value".into(), "retained;value".into())]);
+        apply_setup(
+            &conn,
+            None,
+            &[
+                "  ".into(),
+                "CREATE VIEW sample AS SELECT '{{value}}' AS value".into(),
+            ],
+            &variables,
+        )
+        .unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM sample", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "retained;value");
+    }
+
+    #[test]
+    fn required_setup_failure_prevents_optional_setup() {
+        let conn = Connection::open_in_memory().unwrap();
+        let result = apply_setup(
+            &conn,
+            Some("INVALID REQUIRED SETUP"),
+            &["CREATE TABLE should_not_exist(value INTEGER)".into()],
+            &HashMap::new(),
+        );
+        assert!(result.is_err());
+        assert!(conn.prepare("SELECT * FROM should_not_exist").is_err());
+    }
+
+    #[test]
+    fn required_setup_precedes_optional_definitions() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_setup(
+            &conn,
+            Some("CREATE SCHEMA required_schema"),
+            &["CREATE VIEW required_schema.value AS SELECT 42 AS answer".into()],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let answer: i64 = conn
+            .query_row("SELECT answer FROM required_schema.value", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(answer, 42);
+    }
+
+    #[test]
+    fn request_contract_preserves_independent_setup_entries() {
+        let request: super::ExecuteRequest = serde_json::from_str(
+            r#"{"sql":"SELECT value FROM sample","s3_endpoint":"localhost:4566",
+                "optional_setup_sql":["INVALID SETUP","CREATE VIEW sample AS SELECT 'a;b' AS value"]}"#,
+        ).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        apply_setup(
+            &conn,
+            request.setup_sql.as_deref(),
+            &request.optional_setup_sql,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let value: String = conn.query_row(&request.sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(value, "a;b");
+    }
+
+    #[test]
+    fn old_request_defaults_to_no_optional_setup() {
+        let request: super::ExecuteRequest =
+            serde_json::from_str(r#"{"sql":"SELECT 1","s3_endpoint":"localhost:4566"}"#).unwrap();
+        assert!(request.optional_setup_sql.is_empty());
     }
 }
